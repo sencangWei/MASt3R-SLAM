@@ -44,6 +44,41 @@ def save_traj(
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 
+def save_full_traj(logdir, logfile, timestamps, frames, tracked_poses):
+    """Save tracked camera poses after re-anchoring them to optimized keyframes.
+
+    Each record stores the frame pose relative to the keyframe that tracked it.
+    Applying the final optimized keyframe pose propagates offline backend and loop
+    corrections without inventing poses from an external trajectory.
+    """
+    logfile = pathlib.Path(logdir) / logfile
+    logfile.parent.mkdir(exist_ok=True, parents=True)
+    with logfile.open("w") as stream:
+        for frame_id, anchor_idx, relative_pose_data in tracked_poses:
+            anchor = frames[anchor_idx].T_WC
+            relative = type(anchor)(relative_pose_data.to(anchor.data.device))
+            T_WC = as_SE3(anchor * relative)
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            stream.write(
+                f"{timestamps[frame_id]} {x} {y} {z} {qx} {qy} {qz} {qw}\n"
+            )
+
+
+def save_online_traj(logdir, logfile, timestamps, frames, online_poses):
+    """Save the poses emitted by the frontend before backend re-anchoring."""
+    logfile = pathlib.Path(logdir) / logfile
+    logfile.parent.mkdir(exist_ok=True, parents=True)
+    pose_type = type(frames[0].T_WC)
+    device = frames[0].T_WC.data.device
+    with logfile.open("w") as stream:
+        for frame_id, pose_data in online_poses:
+            T_WC = as_SE3(pose_type(pose_data.to(device)))
+            x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
+            stream.write(
+                f"{timestamps[frame_id]} {x} {y} {z} {qx} {qy} {qz} {qw}\n"
+            )
+
+
 def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     savedir = pathlib.Path(savedir)
     savedir.mkdir(exist_ok=True, parents=True)

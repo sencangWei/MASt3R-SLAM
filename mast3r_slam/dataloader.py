@@ -1,20 +1,41 @@
 import pathlib
 import re
+import csv
 import cv2
 from natsort import natsorted
 import numpy as np
 import torch
 import pyrealsense2 as rs
 import yaml
+from scipy.spatial.transform import Rotation
 
 from mast3r_slam.mast3r_utils import resize_img
 from mast3r_slam.config import config
+from mast3r_slam.stereo_depth import StereoDepthProvider
 
 HAS_TORCHCODEC = True
 try:
     from torchcodec.decoders import VideoDecoder
 except Exception as e:
     HAS_TORCHCODEC = False
+
+
+def reverse_incremental_rotation_priors(rotation_priors):
+    """Invert forward frame increments for reverse chronological tracking."""
+    rotation_priors = np.asarray(rotation_priors)
+    if rotation_priors.ndim != 2 or rotation_priors.shape[1] != 4:
+        raise ValueError("rotation priors must have shape (N, 4)")
+    if len(rotation_priors) == 0:
+        return rotation_priors.copy()
+    reversed_priors = np.empty_like(rotation_priors)
+    reversed_priors[0] = np.asarray(
+        [0.0, 0.0, 0.0, 1.0], dtype=rotation_priors.dtype
+    )
+    if len(rotation_priors) > 1:
+        reversed_priors[1:] = Rotation.from_quat(
+            rotation_priors[:0:-1]
+        ).inv().as_quat().astype(rotation_priors.dtype)
+    return reversed_priors
 
 
 class MonocularDataset(torch.utils.data.Dataset):
@@ -24,6 +45,8 @@ class MonocularDataset(torch.utils.data.Dataset):
         self.timestamps = []
         self.img_size = 512
         self.camera_intrinsics = None
+        self.rotation_priors = None
+        self.stereo_depth_provider = None
         self.use_calibration = config["use_calib"]
         self.save_results = True
 
@@ -59,6 +82,21 @@ class MonocularDataset(torch.utils.data.Dataset):
     def subsample(self, subsample):
         self.rgb_files = self.rgb_files[::subsample]
         self.timestamps = self.timestamps[::subsample]
+        if self.rotation_priors is not None:
+            if subsample != 1:
+                raise ValueError("IMU rotation priors currently require dataset subsample=1")
+
+    def get_rotation_prior(self, idx):
+        if self.rotation_priors is None:
+            return None
+        return self.rotation_priors[idx]
+
+    def get_stereo_depth(self, idx, target_shape):
+        if self.stereo_depth_provider is None:
+            return None
+        return self.stereo_depth_provider.get_depth(
+            pathlib.Path(self.rgb_files[idx]), target_shape
+        )
 
     def has_calib(self):
         return self.camera_intrinsics is not None
@@ -272,6 +310,33 @@ class RGBFiles(MonocularDataset):
         self.dataset_path = pathlib.Path(dataset_path)
         self.rgb_files = natsorted(list((self.dataset_path).glob("*.png")))
         self.timestamps = np.arange(0, len(self.rgb_files)).astype(self.dtype) / 30.0
+        self.stereo_depth_provider = StereoDepthProvider.from_dataset(self.dataset_path)
+        reverse_order = bool(config["dataset"].get("reverse_order", False))
+        if reverse_order:
+            self.rgb_files.reverse()
+        prior_path = self.dataset_path / "imu_rotation_priors.csv"
+        if prior_path.is_file():
+            rows = list(csv.DictReader(prior_path.open(newline="", encoding="utf-8")))
+            if len(rows) != len(self.rgb_files):
+                raise ValueError("IMU rotation prior count does not match RGB frames")
+            indices = [int(row["input_index"]) for row in rows]
+            if indices != list(range(len(rows))):
+                raise ValueError("IMU rotation prior indices are not contiguous")
+            rotation_priors = np.asarray(
+                [
+                    [float(row[key]) for key in ("qx", "qy", "qz", "qw")]
+                    for row in rows
+                ],
+                dtype=self.dtype,
+            )
+            if reverse_order:
+                # Forward row i stores the increment from frame i-1 to i.
+                # A reverse pass needs the inverse increments in reverse order;
+                # its first frame, like the forward pass, has an identity prior.
+                rotation_priors = reverse_incremental_rotation_priors(
+                    rotation_priors
+                )
+            self.rotation_priors = rotation_priors
 
 
 class Intrinsics:
@@ -304,12 +369,16 @@ class Intrinsics:
         if len(calib) > 4:
             distortion = np.array(calib[4:])
         K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-        K_opt = K.copy()
-        mapx, mapy = None, None
-        center = config["dataset"]["center_principle_point"]
-        K_opt, _ = cv2.getOptimalNewCameraMatrix(
-            K, distortion, (W, H), 0, (W, H), centerPrincipalPoint=center
-        )
+        zero_distortion = np.allclose(distortion, 0.0, atol=1e-12)
+        if zero_distortion and not always_undistort:
+            # Preserve the measured D405 pixel geometry. Re-centering a
+            # distortion-free image shifts it relative to the raw stereo depth.
+            K_opt = K.copy()
+        else:
+            center = config["dataset"]["center_principle_point"]
+            K_opt, _ = cv2.getOptimalNewCameraMatrix(
+                K, distortion, (W, H), 0, (W, H), centerPrincipalPoint=center
+            )
         mapx, mapy = cv2.initUndistortRectifyMap(
             K, distortion, None, K_opt, (W, H), cv2.CV_32FC1
         )

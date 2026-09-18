@@ -2,6 +2,7 @@ import dataclasses
 from enum import Enum
 from typing import Optional
 import lietorch
+import numpy as np
 import torch
 from mast3r_slam.mast3r_utils import resize_img
 from mast3r_slam.config import config
@@ -29,6 +30,8 @@ class Frame:
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
+    metric_depth: Optional[np.ndarray] = None
+    metric_anchor_mask: Optional[torch.Tensor] = None
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
@@ -108,17 +111,18 @@ class Frame:
         return self.C / self.N if self.C is not None else None
 
 
-def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
+def create_frame(i, img, T_WC, img_size=512, device="cuda:0", metric_depth=None):
     img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
     img_true_shape = img_shape.clone()
-    uimg = torch.from_numpy(img["unnormalized_img"]) / 255.0
+    # PIL-backed arrays can be read-only; SharedKeyframes may retain this tensor.
+    uimg = torch.from_numpy(np.array(img["unnormalized_img"], copy=True)) / 255.0
     downsample = config["dataset"]["img_downsample"]
     if downsample > 1:
         uimg = uimg[::downsample, ::downsample]
         img_shape = img_shape // downsample
-    frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
+    frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC, metric_depth=metric_depth)
     return frame
 
 
@@ -151,6 +155,10 @@ class SharedStates:
         self.C = torch.zeros(h * w, 1, device=device, dtype=dtype).share_memory_()
         self.feat = torch.zeros(1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
         self.pos = torch.zeros(1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
+        self.metric_anchor_mask = torch.zeros(h * w, device=device, dtype=torch.bool).share_memory_()
+        self.metric_depth = torch.full(
+            (h, w), float("nan"), device="cpu", dtype=dtype
+        ).share_memory_()
         # fmt: on
 
     def set_frame(self, frame):
@@ -165,6 +173,16 @@ class SharedStates:
             self.C[:] = frame.C
             self.feat[:] = frame.feat
             self.pos[:] = frame.pos
+            if frame.metric_anchor_mask is None:
+                self.metric_anchor_mask.zero_()
+            else:
+                self.metric_anchor_mask[:] = frame.metric_anchor_mask
+            if frame.metric_depth is None:
+                self.metric_depth.fill_(float("nan"))
+            else:
+                self.metric_depth[:] = torch.as_tensor(
+                    frame.metric_depth, device="cpu", dtype=self.dtype
+                )
 
     def get_frame(self):
         with self.lock:
@@ -180,6 +198,8 @@ class SharedStates:
             frame.C = self.C
             frame.feat = self.feat
             frame.pos = self.pos
+            frame.metric_anchor_mask = self.metric_anchor_mask
+            frame.metric_depth = self.metric_depth
             return frame
 
     def queue_global_optimization(self, idx):
@@ -245,6 +265,10 @@ class SharedKeyframes:
         self.pos = torch.zeros(buffer, 1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         self.is_dirty = torch.zeros(buffer, 1, device=device, dtype=torch.bool).share_memory_()
         self.K = torch.zeros(3, 3, device=device, dtype=dtype).share_memory_()
+        self.metric_anchor_mask = torch.zeros(buffer, h * w, device=device, dtype=torch.bool).share_memory_()
+        self.metric_depth = torch.full(
+            (buffer, h, w), float("nan"), device="cpu", dtype=dtype
+        ).share_memory_()
         # fmt: on
 
     def __getitem__(self, idx) -> Frame:
@@ -264,6 +288,8 @@ class SharedKeyframes:
             kf.pos = self.pos[idx]
             kf.N = int(self.N[idx])
             kf.N_updates = int(self.N_updates[idx])
+            kf.metric_anchor_mask = self.metric_anchor_mask[idx]
+            kf.metric_depth = self.metric_depth[idx]
             if config["use_calib"]:
                 kf.K = self.K
             return kf
@@ -285,6 +311,16 @@ class SharedKeyframes:
             self.pos[idx] = value.pos
             self.N[idx] = value.N
             self.N_updates[idx] = value.N_updates
+            if value.metric_anchor_mask is None:
+                self.metric_anchor_mask[idx].zero_()
+            else:
+                self.metric_anchor_mask[idx] = value.metric_anchor_mask
+            if value.metric_depth is None:
+                self.metric_depth[idx].fill_(float("nan"))
+            else:
+                self.metric_depth[idx] = torch.as_tensor(
+                    value.metric_depth, device="cpu", dtype=self.dtype
+                )
             self.is_dirty[idx] = True
             return idx
 
