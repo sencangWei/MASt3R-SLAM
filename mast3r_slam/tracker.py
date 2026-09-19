@@ -1,3 +1,5 @@
+import os
+
 import torch
 import lietorch
 import numpy as np
@@ -22,6 +24,21 @@ from mast3r_slam.stereo_depth import (
     scale_pointmaps_with_metric_depth,
     solve_metric_keyframe_pnp,
 )
+
+
+_MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
+
+
+def log_match_stats(frame_id, match_k, valid_kf, valid_opt):
+    """逐帧记录匹配数（仅在 MAST3R_MATCH_LOG 设了路径时生效，默认零行为影响）。"""
+    if not _MATCH_LOG:
+        return
+    new = not os.path.exists(_MATCH_LOG)
+    with open(_MATCH_LOG, "a") as f:
+        if new:
+            f.write("frame_id,n_match,n_match_Q,n_opt,n_total\n")
+        f.write(f"{frame_id},{int(match_k.sum())},{int(valid_kf.sum())},"
+                f"{int(valid_opt.sum())},{int(valid_opt.numel())}\n")
 
 
 def rotation_disagreement_deg(T_visual, T_prior):
@@ -265,6 +282,7 @@ class FrameTracker:
         valid_kf = valid_match_k & valid_Q
 
         match_frac = valid_opt.sum() / valid_opt.numel()
+        log_match_stats(frame.frame_id, valid_match_k, valid_kf, valid_opt)
         if match_frac < self.cfg["min_match_frac"]:
             print(f"Skipped frame {frame.frame_id}")
             return False, [], True
