@@ -1,4 +1,5 @@
 import os
+import atexit
 
 import torch
 import lietorch
@@ -27,6 +28,52 @@ from mast3r_slam.stereo_depth import (
 
 
 _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
+_ROBUST_LOG = os.environ.get("MAST3R_ROBUST_LOG", "")
+_robust_samples = {}  # (width, part) -> list[Tensor]
+
+
+def _column_groups(w):
+    """把 r 的列映射到语义分组（列序见各 optimizer 里 sqrt_info 的拼接顺序）。
+
+    `opt_pose_ray_dist_sim3` 是 [光线(3), 距离(1)]，`opt_pose_calib_sim3` 是
+    [u, v, log_z]。两组的白化尺度差几个数量级，混在一起统计会把结论带偏
+    （第一版就是因为混在一起，才发现不了 pixel/depth 的权重关系 → §28.3）。
+    """
+    if w == 4:
+        return {"ray": slice(0, 3), "dist": slice(3, 4)}
+    if w == 3:
+        return {"pixel": slice(0, 2), "depth": slice(2, 3)}
+    return {"all": slice(0, w)}
+
+
+def log_robust_sample(whitened_r):
+    """记录白化残差 |whitened_r| 的分布（仅在 MAST3R_ROBUST_LOG 设了路径时生效）。"""
+    if not _ROBUST_LOG:
+        return
+    a = whitened_r.detach().abs()
+    for part, sl in _column_groups(a.shape[-1]).items():
+        v = a[..., sl].reshape(-1)
+        if v.numel() > 5000:  # 均匀抽样，避免长跑把内存吃光（每帧每组上限 5000）
+            idx = torch.randint(0, v.numel(), (5000,), device=v.device)
+            v = v[idx]
+        _robust_samples.setdefault((a.shape[-1], part), []).append(v.cpu())
+
+
+def _dump_robust_log():
+    if not _ROBUST_LOG or not _robust_samples:
+        return
+    import numpy as np
+
+    with open(_ROBUST_LOG, "w") as f:
+        f.write("part,width,n,p50,p90,p99,max,frac<1.345,frac<10\n")
+        for (w, part), chunks in sorted(_robust_samples.items(), key=str):
+            v = torch.cat(chunks).numpy().ravel()
+            f.write("%s,%d,%d,%.4g,%.4g,%.4g,%.4g,%.5f,%.5f\n" % (
+                part, w, v.size, *np.percentile(v, [50, 90, 99]).tolist(), v.max(),
+                float((v < 1.345).mean()), float((v < 10.0).mean())))
+
+
+atexit.register(_dump_robust_log)
 
 
 def log_match_stats(frame_id, match_k, valid_kf, valid_opt):
@@ -596,6 +643,7 @@ class FrameTracker:
 
     def solve(self, sqrt_info, r, J):
         whitened_r = sqrt_info * r
+        log_robust_sample(whitened_r)
         robust_sqrt_info = sqrt_info * torch.sqrt(
             huber(whitened_r, k=self.cfg["huber"])
         )
