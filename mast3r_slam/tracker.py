@@ -281,6 +281,21 @@ class FrameTracker:
         valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
         valid_kf = valid_match_k & valid_Q
 
+        # Confidence as a *proportional* weight, not just a hard gate.
+        # Upstream only ever uses C at `valid_Cf/valid_Ck` above, and with the
+        # shipped `C_conf: 0.0` that gate is always open, so C never reaches the
+        # normal equations (the residuals are whitened by `valid * sqrt(Qk)`
+        # only). Measured C is confined to [1.0, 1.5] with 36% of matches at
+        # C<=1.02, and those currently pull with the same weight as good ones.
+        # `C_weight_floor: 1.0` (default) reproduces the upstream weighting
+        # exactly -- 1.0 + 0.0*t is exactly 1.0, and multiplying by 1.0 is exact.
+        w_floor = float(self.cfg.get("C_weight_floor", 1.0))
+        c_lo = float(self.cfg.get("C_weight_lo", 1.0))
+        c_hi = float(self.cfg.get("C_weight_hi", 1.5))
+        conf_w = w_floor + (1.0 - w_floor) * (
+            ((Cf + Ck) * 0.5 - c_lo) / max(c_hi - c_lo, 1e-6)
+        ).clamp(0.0, 1.0)
+
         match_frac = valid_opt.sum() / valid_opt.numel()
         log_match_stats(frame.frame_id, valid_match_k, valid_kf, valid_opt)
         if match_frac < self.cfg["min_match_frac"]:
@@ -419,7 +434,7 @@ class FrameTracker:
             # Track
             if not use_calib:
                 T_WCf, T_CkCf = self.opt_pose_ray_dist_sim3(
-                    Xf, Xk, T_WCf, T_WCk, Qk, valid_opt
+                    Xf, Xk, T_WCf, T_WCk, Qk, valid_opt, conf_w
                 )
             else:
                 T_WCf, T_CkCf = self.opt_pose_calib_sim3(
@@ -429,6 +444,7 @@ class FrameTracker:
                     T_WCk,
                     Qk,
                     valid_opt,
+                    conf_w,
                     meas_k,
                     valid_meas_k,
                     K,
@@ -602,10 +618,10 @@ class FrameTracker:
         )
         return embed_pose_increment(tau, fixed_scale), cost
 
-    def opt_pose_ray_dist_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid):
+    def opt_pose_ray_dist_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid, conf_w):
         last_error = 0
-        sqrt_info_ray = 1 / self.cfg["sigma_ray"] * valid * torch.sqrt(Qk)
-        sqrt_info_dist = 1 / self.cfg["sigma_dist"] * valid * torch.sqrt(Qk)
+        sqrt_info_ray = 1 / self.cfg["sigma_ray"] * valid * conf_w * torch.sqrt(Qk)
+        sqrt_info_dist = 1 / self.cfg["sigma_dist"] * valid * conf_w * torch.sqrt(Qk)
         sqrt_info = torch.cat((sqrt_info_ray.repeat(1, 3), sqrt_info_dist), dim=1)
 
         # Solving for relative pose without scale!
@@ -646,11 +662,11 @@ class FrameTracker:
         return T_WCf, T_CkCf
 
     def opt_pose_calib_sim3(
-        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, meas_k, valid_meas_k, K, img_size
+        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, conf_w, meas_k, valid_meas_k, K, img_size
     ):
         last_error = 0
-        sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * torch.sqrt(Qk)
-        sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * torch.sqrt(Qk)
+        sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * conf_w * torch.sqrt(Qk)
+        sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * conf_w * torch.sqrt(Qk)
         sqrt_info = torch.cat((sqrt_info_pixel.repeat(1, 2), sqrt_info_depth), dim=1)
 
         # Solving for relative pose without scale!
