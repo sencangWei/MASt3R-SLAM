@@ -194,6 +194,10 @@ class FrameTracker:
     def reset_idx_f2k(self):
         self.idx_f2k = None
 
+    def reset_metric_scale_state(self):
+        """Drop the scale carried by the previous keyframe anchor."""
+        self.metric_pointmap_scale = None
+
     def solve_metric_pose(
         self,
         Xf,
@@ -600,6 +604,7 @@ class FrameTracker:
         # Rest idx if new keyframe
         if new_kf:
             self.reset_idx_f2k()
+            self.reset_metric_scale_state()
 
         return (
             new_kf,
