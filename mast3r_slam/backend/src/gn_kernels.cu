@@ -10,6 +10,7 @@
 
 #include <vector>
 #include <iostream>
+#include <cmath>
 
 #include <ATen/ATen.h>
 #include <ATen/NativeFunctions.h>
@@ -107,6 +108,46 @@ class SparseBlock {
         if (i >= 0) {
           for (int j=0; j<M; j++) {
             b(i*M + j) += bs_acc[n][j];
+          }
+        }
+      }
+    }
+
+    void add_metric_pose_priors(torch::Tensor Twc, torch::Tensor targets,
+                                torch::Tensor valid, const int num_fix,
+                                const double position_sigma,
+                                const double log_scale_sigma) {
+      auto poses_cpu = Twc.to(torch::kCPU).to(torch::kFloat64).contiguous();
+      auto targets_cpu = targets.to(torch::kCPU).to(torch::kFloat64).contiguous();
+      auto valid_cpu = valid.to(torch::kCPU).to(torch::kBool).contiguous();
+      auto poses = poses_cpu.accessor<double, 2>();
+      auto desired = targets_cpu.accessor<double, 2>();
+      auto enabled = valid_cpu.accessor<bool, 1>();
+      const double wp = 1.0 / (position_sigma * position_sigma);
+      const double ws = 1.0 / (log_scale_sigma * log_scale_sigma);
+      for (int pose = num_fix; pose < Twc.size(0); ++pose) {
+        if (!enabled[pose]) continue;
+        const double x = poses[pose][0], y = poses[pose][1], z = poses[pose][2];
+        const double scale = poses[pose][7], target_scale = desired[pose][3];
+        TORCH_CHECK(std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+                    scale > 0 && std::isfinite(scale) && target_scale > 0,
+                    "nonfinite metric keyframe pose");
+        Eigen::Matrix<double, 3, 7> J;
+        J << 1, 0, 0, 0, z, -y, x,
+             0, 1, 0, -z, 0, x, y,
+             0, 0, 1, y, -x, 0, z;
+        Eigen::Vector3d residual(x - desired[pose][0],
+                                 y - desired[pose][1],
+                                 z - desired[pose][2]);
+        Eigen::Matrix<double, 7, 7> H = wp * J.transpose() * J;
+        Eigen::Matrix<double, 7, 1> g = wp * J.transpose() * residual;
+        H(6, 6) += ws;
+        g(6) += ws * std::log(scale / target_scale);
+        const int offset = (pose - num_fix) * 7;
+        for (int row = 0; row < 7; ++row) {
+          b(offset + row) += g(row);
+          for (int col = 0; col < 7; ++col) {
+            A.coeffRef(offset + row, offset + col) += H(row, col);
           }
         }
       }
@@ -1556,7 +1597,11 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
   const float C_thresh,
   const float Q_thresh,
   const int max_iter,
-  const float delta_thresh)
+  const float delta_thresh,
+  torch::Tensor metric_targets,
+  torch::Tensor metric_valid,
+  const float metric_position_sigma,
+  const float metric_log_scale_sigma)
 {
   auto opts = Twc.options();
   const int num_edges = ii.size(0);
@@ -1608,12 +1653,18 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
     // pose x pose block
     SparseBlock A(num_poses - num_fix, pose_dim);
 
-    A.update_lhs(Hs.reshape({-1, pose_dim, pose_dim}), 
+    const bool use_metric = metric_targets.numel() > 0;
+    const float visual_normalizer = use_metric ? static_cast<float>(n) : 1.0f;
+    A.update_lhs((Hs / visual_normalizer).reshape({-1, pose_dim, pose_dim}),
         torch::cat({ii_opt, ii_opt, jj_opt, jj_opt}), 
         torch::cat({ii_opt, jj_opt, ii_opt, jj_opt}));
 
-    A.update_rhs(gs.reshape({-1, pose_dim}), 
+    A.update_rhs((gs / visual_normalizer).reshape({-1, pose_dim}),
         torch::cat({ii_opt, jj_opt}));
+    if (use_metric) {
+      A.add_metric_pose_priors(Twc, metric_targets, metric_valid, num_fix,
+                               metric_position_sigma, metric_log_scale_sigma);
+    }
 
     // NOTE: Accounting for negative here!
     dx = -A.solve();

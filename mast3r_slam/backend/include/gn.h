@@ -69,7 +69,11 @@ std::vector<torch::Tensor> gauss_newton_calib_cuda(
   const float C_thresh,
   const float Q_thresh,
   const int max_iter,
-  const float delta_thresh);
+  const float delta_thresh,
+  torch::Tensor metric_targets,
+  torch::Tensor metric_valid,
+  const float metric_position_sigma,
+  const float metric_log_scale_sigma);
 
 std::vector<torch::Tensor> gauss_newton_calib(
   torch::Tensor Twc, torch::Tensor Xs, torch::Tensor Cs,

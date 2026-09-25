@@ -1,3 +1,5 @@
+import os
+
 import lietorch
 import numpy as np
 import torch
@@ -7,6 +9,7 @@ from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
+from mast3r_slam.metric_keyframe_prior import MetricKeyframePrior
 from mast3r_slam.stereo_depth import (
     force_unit_sim3_scale,
     solve_metric_keyframe_pnp,
@@ -31,6 +34,17 @@ class FactorGraph:
         self.window_size = self.cfg["window_size"]
 
         self.K = K
+        self.metric_keyframe_prior = None
+        self.metric_prior_reported = False
+        self.metric_position_sigma = float(config["tracking"].get("vins_backend_position_sigma_m", 0.0))
+        if self.metric_position_sigma > 0.0:
+            path = os.environ.get("MAST3R_VINS_CAMERA_POSES")
+            if not path:
+                raise ValueError("MAST3R_VINS_CAMERA_POSES is required for backend metric priors")
+            self.metric_keyframe_prior = MetricKeyframePrior(path)
+            self.metric_scale_sigma = float(config["tracking"].get("vins_backend_log_scale_sigma", 0.05))
+            if self.metric_scale_sigma <= 0.0:
+                raise ValueError("vins_backend_log_scale_sigma must be positive")
 
     def _metric_pnp_direction(
         self, source_frame, target_frame, target_to_source_index, valid_target
@@ -353,27 +367,28 @@ class FactorGraph:
         img_size = self.frames[0].img.shape[-2:]
         height, width = img_size
 
-        mast3r_slam_backends.gauss_newton_calib(
-            pose_data,
-            Xs,
-            Cs,
-            K,
-            ii,
-            jj,
-            idx_ii2jj,
-            valid_match,
-            Q_ii2jj,
-            height,
-            width,
-            pixel_border,
-            z_eps,
-            sigma_pixel,
-            sigma_depth,
-            C_thresh,
-            Q_thresh,
-            max_iter,
-            delta_thresh,
+        args = (
+            pose_data, Xs, Cs, K, ii, jj, idx_ii2jj, valid_match, Q_ii2jj,
+            height, width, pixel_border, z_eps, sigma_pixel, sigma_depth,
+            C_thresh, Q_thresh, max_iter, delta_thresh,
         )
+        if self.metric_keyframe_prior is None:
+            mast3r_slam_backends.gauss_newton_calib(*args)
+        else:
+            frame_ids = [int(self.frames[index].frame_id) for index in unique_kf_idx]
+            targets, valid = self.metric_keyframe_prior.targets(
+                frame_ids, pose_data.detach().cpu().numpy()
+            )
+            if valid.any() and not self.metric_prior_reported:
+                print("VINS metric factor inside calibrated keyframe GN", int(valid.sum()), flush=True)
+                self.metric_prior_reported = True
+            mast3r_slam_backends.gauss_newton_calib_metric(
+                *args,
+                torch.from_numpy(targets).to(device=self.device),
+                torch.from_numpy(valid).to(device=self.device),
+                self.metric_position_sigma,
+                self.metric_scale_sigma,
+            )
 
         if bool(config["tracking"].get("stereo_fix_pose_scale", False)):
             T_WCs = force_unit_sim3_scale(T_WCs)
