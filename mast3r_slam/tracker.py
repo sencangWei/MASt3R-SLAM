@@ -1,5 +1,6 @@
 import os
 import atexit
+import csv
 
 import torch
 import lietorch
@@ -149,6 +150,49 @@ def motion_keyframe_trigger(T_CkCf, T_prior, T_keyframe, cfg, frame_gap=0):
     return triggered, translation, rotation_deg
 
 
+def metric_translation_prior_terms(pose, target_m, sigma_m, world_scale=1.0):
+    """Linearize a metric camera-i translation target for left Sim(3) updates."""
+    if sigma_m <= 0.0:
+        raise ValueError("metric translation sigma must be positive")
+    if not np.isfinite(world_scale) or world_scale <= 0.0:
+        raise ValueError("keyframe world scale must be finite and positive")
+    translation = pose.data[0, :3]
+    target = torch.as_tensor(target_m, device=translation.device, dtype=translation.dtype)
+    residual = (target - world_scale * translation).reshape(1, 3)
+    jacobian = translation.new_zeros((1, 3, 7))
+    jacobian[0, :, :3] = -torch.eye(3, device=translation.device, dtype=translation.dtype)
+    x, y, z = translation.unbind()
+    jacobian[0, :, 3:6] = torch.stack(
+        (torch.stack((translation.new_zeros(()), -z, y)),
+         torch.stack((z, translation.new_zeros(()), -x)),
+         torch.stack((-y, x, translation.new_zeros(())))),
+    )
+    jacobian[0, :, 6] = -translation
+    jacobian *= world_scale
+    sqrt_info = torch.full_like(residual, 1.0 / sigma_m)
+    return residual, jacobian, sqrt_info
+
+
+def anchored_camera_local_translation_target(
+    keyframe_visual, anchor_visual, anchor_vins, current_vins_position
+):
+    """Bridge a visual keyframe that predates VINS without VINS extrapolation."""
+    keyframe_visual = np.asarray(keyframe_visual, dtype=float)
+    anchor_visual = np.asarray(anchor_visual, dtype=float)
+    anchor_vins = np.asarray(anchor_vins, dtype=float)
+    current_vins_position = np.asarray(current_vins_position, dtype=float)
+    world_alignment = (
+        Rotation.from_quat(anchor_visual[3:7])
+        * Rotation.from_quat(anchor_vins[3:7]).inv()
+    )
+    target_world = anchor_visual[:3] + world_alignment.apply(
+        current_vins_position - anchor_vins[:3]
+    )
+    return Rotation.from_quat(keyframe_visual[3:7]).inv().apply(
+        target_world - keyframe_visual[:3]
+    )
+
+
 class FrameTracker:
     def __init__(self, model, frames, device):
         self.cfg = config["tracking"]
@@ -157,6 +201,23 @@ class FrameTracker:
         self.device = device
         self.metric_pointmap_scale = None
         self.last_metric_anchor_mask = None
+        self.vins_camera_poses = None
+        self.vins_visual_anchor = None
+        self.vins_pose_anchor = None
+        self.vins_translation_prior_sigma_m = float(
+            self.cfg.get("vins_translation_prior_sigma_m", 0.0)
+        )
+        if self.vins_translation_prior_sigma_m > 0.0:
+            if not self.cfg.get("stereo_pointmap_scale_prior", False):
+                raise ValueError("VINS metric translation prior requires metric pointmaps")
+            path = os.environ.get("MAST3R_VINS_CAMERA_POSES")
+            if not path:
+                raise ValueError("MAST3R_VINS_CAMERA_POSES is required")
+            with open(path, newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            if not rows or [int(row["input_index"]) for row in rows] != list(range(len(rows))):
+                raise ValueError("VINS camera pose prior indices must be contiguous")
+            self.vins_camera_poses = rows
 
         self.reset_idx_f2k()
 
@@ -502,6 +563,9 @@ class FrameTracker:
                     Xf, Xk, T_WCf, T_WCk, Qk, valid_opt, conf_w
                 )
             else:
+                metric_translation_target = self.vins_translation_target(
+                    keyframe, frame.frame_id
+                )
                 T_WCf, T_CkCf = self.opt_pose_calib_sim3(
                     Xf,
                     Xk,
@@ -514,6 +578,8 @@ class FrameTracker:
                     valid_meas_k,
                     K,
                     img_size,
+                    metric_translation_target,
+                    float(T_WCk.data[0, 7].item()),
                 )
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
@@ -578,6 +644,11 @@ class FrameTracker:
             T_CkCf = T_WCk.inv() * T_WCf
 
         frame.T_WC = T_WCf
+        if self.vins_camera_poses is not None and self.vins_visual_anchor is None:
+            prior_row = self.vins_camera_poses[frame.frame_id]
+            if prior_row["valid"] == "1":
+                self.vins_visual_anchor = T_WCf.data[0].detach().cpu().numpy().copy()
+                self.vins_pose_anchor = self.vins_pose_from_row(prior_row)
 
         if _FRONTEND_LOG:
             valid_depth = valid_opt.squeeze(-1) & (Xf[:, 2] > 0) & (Xk[:, 2] > 0)
@@ -689,12 +760,14 @@ class FrameTracker:
 
         return Xf[idx_f2k], Xk, T_WCf, T_WCk, Cf[idx_f2k], Ck, meas_k, valid_meas_k
 
-    def solve(self, sqrt_info, r, J):
+    def solve(self, sqrt_info, r, J, visual_row_count=0, visual_effective_count=1):
         whitened_r = sqrt_info * r
         log_robust_sample(whitened_r)
         robust_sqrt_info = sqrt_info * torch.sqrt(
             huber(whitened_r, k=self.cfg["huber"])
         )
+        if visual_row_count:
+            robust_sqrt_info[:visual_row_count] /= np.sqrt(visual_effective_count)
         mdim = J.shape[-1]
         A = (robust_sqrt_info[..., None] * J).view(-1, mdim)  # dr_dX
         b = (robust_sqrt_info * r).view(-1, 1)  # z-h
@@ -707,10 +780,14 @@ class FrameTracker:
 
         return tau_j, cost
 
-    def solve_pose_increment(self, sqrt_info, r, J):
+    def solve_pose_increment(
+        self, sqrt_info, r, J, visual_row_count=0, visual_effective_count=1
+    ):
         fixed_scale = bool(self.cfg.get("stereo_fix_pose_scale", False))
         tau, cost = self.solve(
-            sqrt_info, r, pose_optimization_jacobian(J, fixed_scale)
+            sqrt_info, r, pose_optimization_jacobian(J, fixed_scale),
+            visual_row_count=visual_row_count,
+            visual_effective_count=visual_effective_count,
         )
         return embed_pose_increment(tau, fixed_scale), cost
 
@@ -757,8 +834,40 @@ class FrameTracker:
 
         return T_WCf, T_CkCf
 
+    @staticmethod
+    def vins_pose_from_row(row):
+        return np.asarray(
+            [float(row[axis]) for axis in ("x", "y", "z", "qx", "qy", "qz", "qw")]
+        )
+
+    def vins_translation_target(self, keyframe, frame_id):
+        if self.vins_camera_poses is None:
+            return None
+        if frame_id >= len(self.vins_camera_poses):
+            raise ValueError("VINS camera pose priors end before the tracked frame")
+        keyframe_row = self.vins_camera_poses[keyframe.frame_id]
+        current = self.vins_camera_poses[frame_id]
+        if current["valid"] != "1":
+            return None
+        current_pose = self.vins_pose_from_row(current)
+        if keyframe_row["valid"] == "1":
+            keyframe_pose = self.vins_pose_from_row(keyframe_row)
+            return Rotation.from_quat(keyframe_pose[3:7]).inv().apply(
+                current_pose[:3] - keyframe_pose[:3]
+            )
+        if self.vins_visual_anchor is None:
+            return None
+        return anchored_camera_local_translation_target(
+            keyframe.T_WC.data[0].detach().cpu().numpy(),
+            self.vins_visual_anchor,
+            self.vins_pose_anchor,
+            current_pose[:3],
+        )
+
     def opt_pose_calib_sim3(
-        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, conf_w, meas_k, valid_meas_k, K, img_size
+        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, conf_w, meas_k, valid_meas_k, K, img_size,
+        metric_translation_target=None,
+        metric_world_scale=1.0,
     ):
         last_error = 0
         sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * conf_w * torch.sqrt(Qk)
@@ -786,8 +895,27 @@ class FrameTracker:
             r = meas_k - pzf_Ck
             # Jacobian
             J = -dpzf_Ck_dXf_Ck @ dXf_Ck_dT_CkCf
+            visual_row_count = 0
+            visual_effective_count = 1
 
-            tau_ij_sim3, new_cost = self.solve_pose_increment(sqrt_info2, r, J)
+            if metric_translation_target is not None:
+                if self.cfg.get("vins_translation_prior_normalize_visual", False):
+                    visual_row_count = r.shape[0]
+                    visual_effective_count = max(int(valid2.sum().item()), 1)
+                prior_r, prior_J, prior_info = metric_translation_prior_terms(
+                    T_CkCf, metric_translation_target,
+                    self.vins_translation_prior_sigma_m,
+                    world_scale=metric_world_scale,
+                )
+                r = torch.cat((r, prior_r), dim=0)
+                J = torch.cat((J, prior_J), dim=0)
+                sqrt_info2 = torch.cat((sqrt_info2, prior_info), dim=0)
+
+            tau_ij_sim3, new_cost = self.solve_pose_increment(
+                sqrt_info2, r, J,
+                visual_row_count=visual_row_count,
+                visual_effective_count=visual_effective_count,
+            )
             T_CkCf = T_CkCf.retr(tau_ij_sim3)
 
             if check_convergence(
