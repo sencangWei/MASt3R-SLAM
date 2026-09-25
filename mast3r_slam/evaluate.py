@@ -70,12 +70,17 @@ def save_online_traj(logdir, logfile, timestamps, frames, online_poses):
     logfile.parent.mkdir(exist_ok=True, parents=True)
     pose_type = type(frames[0].T_WC)
     device = frames[0].T_WC.data.device
-    with logfile.open("w") as stream:
+    scale_logfile = logfile.with_name(f"{logfile.stem}_sim3_scale.csv")
+    with logfile.open("w") as stream, scale_logfile.open("w") as scale_stream:
+        scale_stream.write("frame_id,t_sec,sim3_scale\n")
         for frame_id, pose_data in online_poses:
             T_WC = as_SE3(pose_type(pose_data.to(device)))
             x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
             stream.write(
                 f"{timestamps[frame_id]} {x} {y} {z} {qx} {qy} {qz} {qw}\n"
+            )
+            scale_stream.write(
+                f"{frame_id},{timestamps[frame_id]},{float(pose_data.reshape(-1)[7])}\n"
             )
 
 
