@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import datetime
+import os
 import pathlib
 import sys
 import time
@@ -333,6 +334,9 @@ if __name__ == "__main__":
     use_stereo_pointmap_scale = bool(
         config["tracking"].get("stereo_pointmap_scale_prior", False)
     )
+    trace_frontend = bool(os.environ.get("MAST3R_FRONTEND_LOG"))
+    if trace_frontend and dataset.stereo_depth_provider is None:
+        raise ValueError("MAST3R_FRONTEND_LOG requires exported stereo-right images")
     if use_imu_rotation_prior and dataset.rotation_priors is None:
         raise ValueError(
             "tracking.imu_rotation_prior requires imu_rotation_priors.csv"
@@ -478,7 +482,13 @@ if __name__ == "__main__":
         add_new_kf = False
         tracked = False
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track(frame)
+            diagnostic_depth = (
+                dataset.get_stereo_depth(i, (h, w))
+                if trace_frontend and i % 3 == 0 else None
+            )
+            add_new_kf, match_info, try_reloc = tracker.track(
+                frame, diagnostic_depth=diagnostic_depth
+            )
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             else:

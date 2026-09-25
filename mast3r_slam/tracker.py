@@ -22,6 +22,7 @@ from mast3r_slam.stereo_depth import (
     metric_depth_anchor_mask,
     pose_optimization_jacobian,
     refine_metric_translation_3d3d,
+    robust_pointmap_metric_scale,
     scale_pointmaps_with_metric_depth,
     solve_metric_keyframe_pnp,
 )
@@ -29,6 +30,7 @@ from mast3r_slam.stereo_depth import (
 
 _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
 _ROBUST_LOG = os.environ.get("MAST3R_ROBUST_LOG", "")
+_FRONTEND_LOG = os.environ.get("MAST3R_FRONTEND_LOG", "")
 _robust_samples = {}  # (width, part) -> list[Tensor]
 
 
@@ -283,7 +285,7 @@ class FrameTracker:
         pose_data[:, 7] = 1.0
         return lietorch.Sim3(pose_data), report
 
-    def track(self, frame: Frame):
+    def track(self, frame: Frame, diagnostic_depth=None):
         keyframe = self.keyframes.last_keyframe()
         rotation_prior_pose = frame.T_WC
 
@@ -331,6 +333,18 @@ class FrameTracker:
 
         valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
         valid_kf = valid_match_k & valid_Q
+
+        diagnostic_scale = None
+        if _FRONTEND_LOG and diagnostic_depth is not None:
+            diagnostic_scale = robust_pointmap_metric_scale(
+                Xff[..., 2].detach().cpu().numpy(),
+                Cff.detach().cpu().numpy(),
+                diagnostic_depth,
+                minimum_points=int(self.cfg.get("stereo_scale_min_points", 500)),
+                minimum_depth_m=float(self.cfg.get("stereo_scale_min_depth_m", 0.15)),
+                maximum_depth_m=float(self.cfg.get("stereo_scale_max_depth_m", 0.65)),
+                minimum_confidence=float(self.cfg.get("stereo_scale_min_confidence", 1.5)),
+            )
 
         # Confidence as a *proportional* weight, not just a hard gate.
         # Upstream only ever uses C at `valid_Cf/valid_Ck` above, and with the
@@ -564,6 +578,35 @@ class FrameTracker:
             T_CkCf = T_WCk.inv() * T_WCf
 
         frame.T_WC = T_WCf
+
+        if _FRONTEND_LOG:
+            valid_depth = valid_opt.squeeze(-1) & (Xf[:, 2] > 0) & (Xk[:, 2] > 0)
+            zf = (
+                float(Xf[valid_depth, 2].median().item())
+                if valid_depth.any() else float("nan")
+            )
+            zk = (
+                float(Xk[valid_depth, 2].median().item())
+                if valid_depth.any() else float("nan")
+            )
+            new_log = not os.path.exists(_FRONTEND_LOG)
+            with open(_FRONTEND_LOG, "a") as stream:
+                if new_log:
+                    stream.write(
+                        "frame_id,keyframe_id,n_opt,n_total,"
+                        "pointmap_z_current,pointmap_z_keyframe,"
+                        "metric_pointmap_scale,metric_relative_mad,metric_points,"
+                        "relative_translation,relative_scale\n"
+                    )
+                report = diagnostic_scale or {}
+                stream.write(
+                    f"{frame.frame_id},{keyframe.frame_id},{int(valid_opt.sum())},{valid_opt.numel()},"
+                    f"{zf},{zk},{report.get('scale', float('nan'))},"
+                    f"{report.get('relative_mad', float('nan'))},"
+                    f"{report.get('inlier_points', 0)},"
+                    f"{float(torch.linalg.vector_norm(T_CkCf.data[..., :3]).item())},"
+                    f"{float(T_CkCf.data[..., 7].item())}\n"
+                )
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
