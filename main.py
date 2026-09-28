@@ -425,6 +425,7 @@ if __name__ == "__main__":
     online_poses = []
 
     while True:
+        raise_if_backend_exited(backend)
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
         last_msg = msg if msg is not None else last_msg
