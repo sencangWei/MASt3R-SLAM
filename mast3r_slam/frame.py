@@ -210,6 +210,10 @@ class SharedStates:
         with self.lock:
             self.reloc_sem.value += 1
 
+    def has_pending_reloc(self):
+        with self.lock:
+            return self.reloc_sem.value > 0
+
     def dequeue_reloc(self):
         with self.lock:
             if self.reloc_sem.value == 0:

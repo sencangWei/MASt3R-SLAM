@@ -177,6 +177,11 @@ def run_backend(cfg, model, states, keyframes, K):
             time.sleep(0.01)
             continue
         if mode == Mode.RELOC:
+            # Mode is set before the frontend finishes preparing/queuing the
+            # frame. Processing it early can leave an unconsumed request.
+            if not states.has_pending_reloc():
+                time.sleep(0.01)
+                continue
             frame = states.get_frame()
             success = relocalization(frame, keyframes, factor_graph, retrieval_database)
             if success:
