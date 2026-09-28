@@ -36,6 +36,11 @@ class RuntimeWindowMsg:
     C_conf_threshold: float = 1.5
 
 
+def raise_if_backend_exited(backend):
+    if backend.exitcode is not None:
+        raise RuntimeError(f"MASt3R backend exited with exit code {backend.exitcode}")
+
+
 def apply_rotation_prior(T_WC, quaternion_xyzw):
     delta_data = torch.zeros((1, 8), dtype=T_WC.data.dtype, device=T_WC.data.device)
     delta_data[:, 3:7] = torch.as_tensor(
@@ -513,6 +518,7 @@ if __name__ == "__main__":
             states.queue_reloc()
             # In single threaded mode, make sure relocalization happen for every frame
             while config["single_thread"]:
+                raise_if_backend_exited(backend)
                 with states.lock:
                     if states.reloc_sem.value == 0:
                         break
@@ -526,6 +532,7 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
+                raise_if_backend_exited(backend)
                 with states.lock:
                     if len(states.global_optimizer_tasks) == 0:
                         break
