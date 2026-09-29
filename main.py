@@ -36,6 +36,11 @@ class RuntimeWindowMsg:
     C_conf_threshold: float = 1.5
 
 
+def raise_if_backend_exited(backend):
+    if backend.exitcode is not None:
+        raise RuntimeError(f"MASt3R backend exited with exit code {backend.exitcode}")
+
+
 def apply_rotation_prior(T_WC, quaternion_xyzw):
     delta_data = torch.zeros((1, 8), dtype=T_WC.data.dtype, device=T_WC.data.device)
     delta_data[:, 3:7] = torch.as_tensor(
@@ -177,6 +182,11 @@ def run_backend(cfg, model, states, keyframes, K):
             time.sleep(0.01)
             continue
         if mode == Mode.RELOC:
+            # Mode is set before the frontend finishes preparing/queuing the
+            # frame. Processing it early can leave an unconsumed request.
+            if not states.has_pending_reloc():
+                time.sleep(0.01)
+                continue
             frame = states.get_frame()
             success = relocalization(frame, keyframes, factor_graph, retrieval_database)
             if success:
@@ -402,6 +412,12 @@ if __name__ == "__main__":
             recon_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
+    if config["tracking"].get("stereo_imu_anchor_guard", False):
+        if dataset.rotation_priors is None:
+            raise ValueError("stereo/IMU anchor correction requires IMU rotation priors")
+        tracker.configure_stereo_imu_anchor(
+            dataset.rotation_priors,
+            dataset.get_stereo_depth if dataset.stereo_depth_provider is not None else None)
     last_msg = RuntimeWindowMsg()
 
     backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
@@ -415,6 +431,7 @@ if __name__ == "__main__":
     online_poses = []
 
     while True:
+        raise_if_backend_exited(backend)
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
         last_msg = msg if msg is not None else last_msg
@@ -508,6 +525,7 @@ if __name__ == "__main__":
             states.queue_reloc()
             # In single threaded mode, make sure relocalization happen for every frame
             while config["single_thread"]:
+                raise_if_backend_exited(backend)
                 with states.lock:
                     if states.reloc_sem.value == 0:
                         break
@@ -521,6 +539,7 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
+                raise_if_backend_exited(backend)
                 with states.lock:
                     if len(states.global_optimizer_tasks) == 0:
                         break

@@ -27,6 +27,7 @@ from mast3r_slam.stereo_depth import (
     scale_pointmaps_with_metric_depth,
     solve_metric_keyframe_pnp,
 )
+from mast3r_slam.stereo_imu_anchor import integrate_imu_rotations, propose_anchor_pose
 
 
 _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
@@ -204,6 +205,7 @@ class FrameTracker:
         self.vins_camera_poses = None
         self.vins_visual_anchor = None
         self.vins_pose_anchor = None
+        self.stereo_imu_anchor = None
         self.vins_translation_prior_sigma_m = float(
             self.cfg.get("vins_translation_prior_sigma_m", 0.0)
         )
@@ -220,6 +222,48 @@ class FrameTracker:
             self.vins_camera_poses = rows
 
         self.reset_idx_f2k()
+
+    def configure_stereo_imu_anchor(self, increments, depth_getter):
+        if depth_getter is None:
+            raise ValueError("stereo/IMU anchor correction requires independent stereo depth")
+        self.stereo_imu_anchor = dict(
+            rotations=integrate_imu_rotations(increments),
+            depth_getter=depth_getter,
+            depth_cache={},
+        )
+
+    def correct_stereo_imu_anchor(self, frame, keyframe, relative_pose, valid,
+                                  current_ids, keyframe_points, current_points,
+                                  K, shape):
+        state = self.stereo_imu_anchor
+        if state is None:
+            return None
+        rotations = state["rotations"]
+        imu_relative = rotations[keyframe.frame_id].inv() * rotations[frame.frame_id]
+        visual_relative = relative_pose.data[0].detach().cpu().numpy()
+        visual_rotation = Rotation.from_quat(visual_relative[3:7])
+        if (visual_rotation.inv()*imu_relative).magnitude()*180/np.pi <= 1.0:
+            return None
+        cache = state["depth_cache"]
+        for index in (keyframe.frame_id, frame.frame_id):
+            if index not in cache:
+                cache[index] = state["depth_getter"](index, tuple(shape))
+        if len(cache) > 4:
+            for index in list(cache):
+                if index not in (keyframe.frame_id, frame.frame_id):
+                    cache.pop(index)
+        updated, report = propose_anchor_pose(
+            visual_relative, imu_relative, valid.detach().cpu().numpy(),
+            current_ids.detach().cpu().numpy(),
+            keyframe_points.detach().cpu().numpy(),
+            current_points.detach().cpu().numpy(), K.detach().cpu().numpy(),
+            cache[keyframe.frame_id], cache[frame.frame_id])
+        if updated is None:
+            return None
+        print("Stereo/IMU anchor correction", frame.frame_id, keyframe.frame_id, report)
+        tensor = torch.as_tensor(updated, dtype=relative_pose.data.dtype,
+                                 device=relative_pose.data.device).reshape(1, 8)
+        return lietorch.Sim3(tensor)
 
     def scale_pointmaps(self, pointmaps, confidence, metric_depth):
         scaled, report = scale_pointmaps_with_metric_depth(
@@ -642,6 +686,13 @@ class FrameTracker:
         if bool(self.cfg.get("stereo_fix_pose_scale", False)):
             T_WCf = force_unit_sim3_scale(T_WCf)
             T_CkCf = T_WCk.inv() * T_WCf
+
+        if self.stereo_imu_anchor is not None:
+            corrected = self.correct_stereo_imu_anchor(
+                frame, keyframe, T_CkCf, valid_opt, idx_f2k, Xk, Xf, K, img_size)
+            if corrected is not None:
+                T_CkCf = corrected
+                T_WCf = T_WCk * T_CkCf
 
         frame.T_WC = T_WCf
         if self.vins_camera_poses is not None and self.vins_visual_anchor is None:
