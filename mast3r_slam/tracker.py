@@ -16,7 +16,7 @@ from mast3r_slam.geometry import (
 )
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
-from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
+from mast3r_slam.mast3r_utils import mast3r_asymmetric_inference, mast3r_match_asymmetric
 from mast3r_slam.stereo_depth import (
     embed_pose_increment,
     force_unit_sim3_scale,
@@ -28,6 +28,10 @@ from mast3r_slam.stereo_depth import (
     solve_metric_keyframe_pnp,
 )
 from mast3r_slam.stereo_imu_anchor import integrate_imu_rotations, propose_anchor_pose
+from mast3r_slam.stereo_descriptor_recovery import (
+    imu_rotation_agrees,
+    metric_descriptor_pose,
+)
 
 
 _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
@@ -231,6 +235,56 @@ class FrameTracker:
             depth_getter=depth_getter,
             depth_cache={},
         )
+
+    @torch.inference_mode()
+    def recover_stereo_descriptor(self, frame, previous_frame, camera_matrix,
+                                  rotation_prior):
+        """Rescue one failed frame with independent descriptor/stereo geometry.
+
+        The result is a pose-only observation, not a new graph keyframe or a
+        replacement for the existing MASt3R pointmap factors.
+        """
+        from mast3r.fast_nn import fast_reciprocal_NNs
+
+        if previous_frame.metric_depth is None or frame.metric_depth is None:
+            return {"accepted": False, "reason": "stereo_depth_unavailable"}
+        X, C, D, _ = mast3r_asymmetric_inference(
+            self.model, previous_frame, frame
+        )
+        source_xy, target_xy = fast_reciprocal_NNs(
+            D[0], D[1], subsample_or_initxy1=8,
+            device=self.device, dist="dot", block_size=8192,
+        )
+        source_depth = np.asarray(previous_frame.metric_depth)
+        target_depth = np.asarray(frame.metric_depth)
+        pose, scale, report = metric_descriptor_pose(
+            source_xy, target_xy, source_depth, target_depth,
+            X[0, ..., 2].detach().cpu().numpy(),
+            C[0].detach().cpu().numpy(), camera_matrix,
+        )
+        if pose is None:
+            return report
+        rotation_ok, rotation_error = imu_rotation_agrees(
+            pose, rotation_prior
+        )
+        report["imu_rotation_disagreement_deg"] = rotation_error
+        displacement = float(np.linalg.norm(pose[:3, 3]))
+        report["step_translation_m"] = displacement
+        if not rotation_ok or displacement > 0.03:
+            return dict(report, accepted=False, reason="motion_prior_disagreement")
+        relative = np.linalg.inv(pose)
+        quaternion = Rotation.from_matrix(relative[:3, :3]).as_quat()
+        pose_data = frame.T_WC.data.new_zeros((1, 8))
+        pose_data[0, :3] = torch.as_tensor(
+            relative[:3, 3] / scale, device=self.device, dtype=pose_data.dtype
+        )
+        pose_data[0, 3:7] = torch.as_tensor(
+            quaternion, device=self.device, dtype=pose_data.dtype
+        )
+        pose_data[0, 7] = 1.0
+        frame.T_WC = previous_frame.T_WC * lietorch.Sim3(pose_data)
+        self.reset_idx_f2k()
+        return report
 
     def correct_stereo_imu_anchor(self, frame, keyframe, relative_pose, valid,
                                   current_ids, keyframe_points, current_points,

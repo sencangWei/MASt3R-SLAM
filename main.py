@@ -1,12 +1,14 @@
 import argparse
 import dataclasses
 import datetime
+import json
 import os
 import pathlib
 import sys
 import time
 import cv2
 import lietorch
+import numpy as np
 import torch
 import tqdm
 import yaml
@@ -20,6 +22,7 @@ from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
     mast3r_inference_mono,
+    resize_img,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
@@ -359,6 +362,27 @@ if __name__ == "__main__":
 
     dataset = load_dataset(args.dataset)
     dataset.subsample(config["dataset"]["subsample"])
+    descriptor_recovery = os.environ.get("MAST3R_STEREO_DESCRIPTOR_RECOVERY") == "1"
+    recovery_K = None
+    if descriptor_recovery:
+        if dataset.stereo_depth_provider is None or dataset.rotation_priors is None:
+            raise ValueError("stereo descriptor recovery needs synchronized right IR and IMU priors")
+        manifest = json.loads((pathlib.Path(args.dataset) / "dataset_manifest.json").read_text())
+        camera = manifest["camera_info"]
+        if any(float(value) != 0.0 for value in camera["coeffs"]):
+            raise ValueError("stereo descriptor recovery needs rectified zero-distortion IR")
+        _, (scale_w, scale_h, crop_w, crop_h) = resize_img(
+            np.zeros((camera["height"], camera["width"], 3)),
+            dataset.img_size, return_transformation=True,
+        )
+        downsample = config["dataset"]["img_downsample"]
+        recovery_K = np.array([
+            [camera["fx"] / scale_w / downsample, 0,
+             (camera["ppx"] / scale_w - crop_w) / downsample],
+            [0, camera["fy"] / scale_h / downsample,
+             (camera["ppy"] / scale_h - crop_h) / downsample],
+            [0, 0, 1],
+        ], dtype=np.float64)
     use_imu_rotation_prior = bool(
         config["tracking"].get("imu_rotation_prior", False)
     )
@@ -553,8 +577,22 @@ if __name__ == "__main__":
                     tracking_anchor_idx = previous_idx
                     print(f"Recovered frame {i} using previous keyframe {previous_idx}")
             if try_reloc:
-                states.set_mode(Mode.RELOC)
-            else:
+                if descriptor_recovery:
+                    previous_frame = states.get_frame()
+                    previous_frame.metric_depth = dataset.get_stereo_depth(
+                        previous_frame.frame_id, (h, w)
+                    )
+                    frame.metric_depth = dataset.get_stereo_depth(i, (h, w))
+                    report = tracker.recover_stereo_descriptor(
+                        frame, previous_frame, recovery_K,
+                        dataset.get_rotation_prior(i),
+                    )
+                    print("Stereo descriptor recovery", i, report)
+                    if report["accepted"]:
+                        try_reloc = False
+                if try_reloc:
+                    states.set_mode(Mode.RELOC)
+            if not try_reloc:
                 tracked = True
             states.set_frame(frame)
 
