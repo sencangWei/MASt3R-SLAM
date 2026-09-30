@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import mast3r_slam.image as img_utils
@@ -5,9 +6,21 @@ from mast3r_slam.config import config
 import mast3r_slam_backends
 
 
-def match(X11, X21, D11, D21, idx_1_to_2_init=None):
-    idx_1_to_2, valid_match2 = match_iterative_proj(X11, X21, D11, D21, idx_1_to_2_init)
+def match(X11, X21, D11, D21, idx_1_to_2_init=None,
+          metric_distance_m=0.0, metric_scale=None):
+    idx_1_to_2, valid_match2 = match_iterative_proj(
+        X11, X21, D11, D21, idx_1_to_2_init,
+        metric_distance_m=metric_distance_m, metric_scale=metric_scale,
+    )
     return idx_1_to_2, valid_match2
+
+
+def match_distance_threshold(original, metric_distance_m, metric_scale):
+    """Convert an opt-in physical distance gate into the current pointmap gauge."""
+    if (metric_distance_m > 0 and metric_scale is not None
+            and math.isfinite(metric_scale) and metric_scale > 0):
+        return metric_distance_m / metric_scale
+    return original
 
 
 def pixel_to_lin(p1, w):
@@ -49,7 +62,8 @@ def prep_for_iter_proj(X11, X21, idx_1_to_2_init):
     return rays_with_grad_img, pts3d_norm, p_init
 
 
-def match_iterative_proj(X11, X21, D11, D21, idx_1_to_2_init=None):
+def match_iterative_proj(X11, X21, D11, D21, idx_1_to_2_init=None,
+                         metric_distance_m=0.0, metric_scale=None):
     cfg = config["matching"]
     b, h, w = X21.shape[:3]
     device = X11.device
@@ -72,7 +86,10 @@ def match_iterative_proj(X11, X21, D11, D21, idx_1_to_2_init=None):
     dists2 = torch.linalg.norm(
         X11[batch_inds, p1[..., 1], p1[..., 0], :].reshape(b, h, w, 3) - X21, dim=-1
     )
-    valid_dists2 = (dists2 < cfg["dist_thresh"]).view(b, -1)
+    threshold = match_distance_threshold(
+        cfg["dist_thresh"], metric_distance_m, metric_scale
+    )
+    valid_dists2 = (dists2 < threshold).view(b, -1)
     valid_proj2 = valid_proj2 & valid_dists2
 
     if cfg["radius"] > 0:

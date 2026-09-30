@@ -9,6 +9,7 @@ from mast3r.model import AsymmetricMASt3R
 from mast3r_slam.retrieval_database import RetrievalDatabase
 from mast3r_slam.config import config
 import mast3r_slam.matching as matching
+from mast3r_slam.stereo_depth import robust_pointmap_metric_scale
 
 
 def load_mast3r(path=None, device="cuda"):
@@ -206,7 +207,8 @@ def mast3r_asymmetric_inference(model, frame_i, frame_j):
     return X, C, D, Q
 
 
-def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
+def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None,
+                            metric_distance_m=0.0):
     X, C, D, Q = mast3r_asymmetric_inference(model, frame_i, frame_j)
 
     b, h, w = X.shape[:-1]
@@ -218,8 +220,20 @@ def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
     Dii, Dji = D[:b], D[b:]
     Qii, Qji = Q[:b], Q[b:]
 
+    metric_scale = None
+    if metric_distance_m > 0 and frame_i.metric_depth is not None:
+        scale_report = robust_pointmap_metric_scale(
+            Xii[..., 2].detach().cpu().numpy(),
+            Cii.detach().cpu().numpy(), frame_i.metric_depth,
+            minimum_points=500, minimum_depth_m=0.15,
+            maximum_depth_m=0.65, minimum_confidence=1.0,
+        )
+        if scale_report["accepted"] and scale_report["relative_mad"] <= 0.15:
+            metric_scale = scale_report["scale"]
+
     idx_i2j, valid_match_j = matching.match(
-        Xii, Xji, Dii, Dji, idx_1_to_2_init=idx_i2j_init
+        Xii, Xji, Dii, Dji, idx_1_to_2_init=idx_i2j_init,
+        metric_distance_m=metric_distance_m, metric_scale=metric_scale,
     )
 
     # How rest of system expects it

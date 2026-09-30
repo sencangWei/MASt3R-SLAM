@@ -389,6 +389,9 @@ if __name__ == "__main__":
     use_stereo_pointmap_scale = bool(
         config["tracking"].get("stereo_pointmap_scale_prior", False)
     )
+    use_metric_match_gate = float(
+        config["tracking"].get("metric_match_distance_m", 0.0)
+    ) > 0.0
     trace_frontend = bool(os.environ.get("MAST3R_FRONTEND_LOG"))
     if trace_frontend and dataset.stereo_depth_provider is None:
         raise ValueError("MAST3R_FRONTEND_LOG requires exported stereo-right images")
@@ -399,9 +402,11 @@ if __name__ == "__main__":
     if use_imu_rotation_prior:
         print("Using calibrated IMU rotation priors for frame initialization")
     h, w = dataset.get_img_shape()[0]
-    if use_stereo_pointmap_scale and dataset.stereo_depth_provider is None:
+    if (
+        use_stereo_pointmap_scale or use_metric_match_gate
+    ) and dataset.stereo_depth_provider is None:
         raise ValueError(
-            "tracking.stereo_pointmap_scale_prior requires exported stereo-right images"
+            "stereo metric tracking requires exported stereo-right images"
         )
     if use_stereo_pointmap_scale:
         print("Using synchronized D405 stereo pointmap scale priors")
@@ -509,7 +514,8 @@ if __name__ == "__main__":
         if use_imu_rotation_prior and i > 0:
             T_WC = apply_rotation_prior(T_WC, dataset.get_rotation_prior(i))
         metric_depth = (
-            dataset.get_stereo_depth(i, (h, w)) if use_stereo_pointmap_scale else None
+            dataset.get_stereo_depth(i, (h, w))
+            if use_stereo_pointmap_scale or use_metric_match_gate else None
         )
         frame = create_frame(
             i,
@@ -524,7 +530,8 @@ if __name__ == "__main__":
             # Initialize via mono inference, and encoded features neeed for database
             X_init, C_init = mast3r_inference_mono(model, frame)
             (X_init,), stereo_scale_report = tracker.scale_pointmaps(
-                (X_init,), C_init, frame.metric_depth
+                (X_init,), C_init,
+                frame.metric_depth if use_stereo_pointmap_scale else None,
             )
             frame.metric_anchor_mask = tracker.last_metric_anchor_mask
             if use_stereo_pointmap_scale:
@@ -599,7 +606,8 @@ if __name__ == "__main__":
         elif mode == Mode.RELOC:
             X, C = mast3r_inference_mono(model, frame)
             (X,), stereo_scale_report = tracker.scale_pointmaps(
-                (X,), C, frame.metric_depth
+                (X,), C,
+                frame.metric_depth if use_stereo_pointmap_scale else None,
             )
             frame.metric_anchor_mask = tracker.last_metric_anchor_mask
             if use_stereo_pointmap_scale:

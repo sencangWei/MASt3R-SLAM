@@ -470,10 +470,13 @@ class FrameTracker:
         rotation_prior_pose = frame.T_WC
 
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
-            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k,
+            metric_distance_m=float(self.cfg.get("metric_match_distance_m", 0.0)),
         )
         (Xff, Xkf), stereo_scale_report = self.scale_pointmaps(
-            (Xff, Xkf), Cff, frame.metric_depth
+            (Xff, Xkf), Cff,
+            frame.metric_depth
+            if self.cfg.get("stereo_pointmap_scale_prior", False) else None,
         )
         frame.metric_anchor_mask = self.last_metric_anchor_mask
         if (
