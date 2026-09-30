@@ -262,6 +262,17 @@ class FrameTracker:
             X[0, ..., 2].detach().cpu().numpy(),
             C[0].detach().cpu().numpy(), camera_matrix,
         )
+        if pose is None and report.get("reason") == "too_few_stereo_matches":
+            # D405 IR can drive pointmap confidence to its 1.0 floor while
+            # reciprocal 2D matches remain geometrically valid. The relaxed
+            # pass still has to clear PnP, two-view depth, scale, and IMU gates.
+            pose, scale, report = metric_descriptor_pose(
+                source_xy, target_xy, source_depth, target_depth,
+                X[0, ..., 2].detach().cpu().numpy(),
+                C[0].detach().cpu().numpy(), camera_matrix,
+                minimum_confidence=1.0,
+            )
+            report["low_confidence_geometry_retry"] = True
         if pose is None:
             return report
         rotation_ok, rotation_error = imu_rotation_agrees(

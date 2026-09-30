@@ -41,6 +41,32 @@ def test_metric_descriptor_pose_rejects_missing_depth():
     assert report["reason"] == "too_few_stereo_matches"
 
 
+def test_low_network_confidence_still_requires_independent_geometry():
+    height, width = 80, 120
+    yy, xx = np.indices((height, width))
+    source_xy = np.column_stack((xx[::2, ::2].ravel(), yy[::2, ::2].ravel()))
+    source_xy = source_xy[source_xy[:, 0] < width - 5]
+    target_xy = source_xy + np.array([2, 0])
+    depth = np.full((height, width), 0.3, dtype=np.float32)
+    K = np.array([[200.0, 0, 60], [0, 200.0, 40], [0, 0, 1]])
+    confidence = np.full_like(depth, 1.01)
+    _, _, strict = metric_descriptor_pose(
+        source_xy, target_xy, depth, depth, depth / 0.4, confidence, K,
+    )
+    pose, _, geometry = metric_descriptor_pose(
+        source_xy, target_xy, depth, depth, depth / 0.4, confidence, K,
+        minimum_confidence=1.0,
+    )
+    assert strict["reason"] == "too_few_stereo_matches"
+    assert pose is not None and geometry["accepted"]
+    missing_depth = np.full_like(depth, np.nan)
+    pose, _, rejected = metric_descriptor_pose(
+        source_xy, target_xy, depth, missing_depth,
+        depth / 0.4, confidence, K, minimum_confidence=1.0,
+    )
+    assert pose is None and rejected["reason"] == "too_few_depth_checks"
+
+
 def test_imu_gate_uses_inverse_pnp_rotation():
     source_to_target = np.eye(4)
     source_to_target[:3, :3] = Rotation.from_euler("z", 1, degrees=True).as_matrix()
