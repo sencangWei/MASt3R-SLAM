@@ -17,6 +17,17 @@ from mast3r_slam.stereo_depth import (
 import mast3r_slam_backends
 
 
+def local_asymmetric_reloc_valid(
+    forward_frac, reverse_frac, source_frame_gap, local_min_frac, reloc_min_frac
+):
+    """Allow a recent partial-view match, but never relax a distant loop."""
+    return (
+        0 < source_frame_gap <= 30
+        and min(forward_frac, reverse_frac) >= local_min_frac
+        and max(forward_frac, reverse_frac) >= reloc_min_frac
+    )
+
+
 class FactorGraph:
     def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda"):
         self.model = model
@@ -228,6 +239,22 @@ class FactorGraph:
         ni = valid_i.shape[1] * valid_i.shape[2]
         match_frac_j = valid_j.sum(dim=(1, 2)) / nj
         match_frac_i = valid_i.sum(dim=(1, 2)) / ni
+        if is_reloc and os.environ.get("MAST3R_RELOC_TRACE") == "1":
+            trace_count = getattr(self, "_reloc_trace_count", 0)
+            if trace_count < 12 or trace_count % 30 == 0:
+                print(
+                    "Reloc candidate match fractions",
+                    list(jj),
+                    [round(float(v), 4) for v in match_frac_j.tolist()],
+                    [round(float(v), 4) for v in match_frac_i.tolist()],
+                    "raw",
+                    [round(float(v), 4) for v in valid_match_j.float().mean((1, 2)).tolist()],
+                    [round(float(v), 4) for v in valid_match_i.float().mean((1, 2)).tolist()],
+                    "confidence",
+                    [round(float(v), 4) for v in valid_Qj.float().mean((1, 2)).tolist()],
+                    [round(float(v), 4) for v in valid_Qi.float().mean((1, 2)).tolist()],
+                )
+            self._reloc_trace_count = trace_count + 1
 
         ii_tensor = torch.as_tensor(ii, device=self.device)
         jj_tensor = torch.as_tensor(jj, device=self.device)
@@ -236,6 +263,17 @@ class FactorGraph:
         invalid_edges = torch.minimum(match_frac_j, match_frac_i) < min_match_frac
         consecutive_edges = ii_tensor == (jj_tensor - 1)
         invalid_edges = (~consecutive_edges) & invalid_edges
+
+        if is_reloc and os.environ.get("MAST3R_RELOC_ASYMMETRIC_LOCAL") == "1":
+            for edge_index, (current, candidate) in enumerate(zip(kf_ii, kf_jj)):
+                if local_asymmetric_reloc_valid(
+                    float(match_frac_j[edge_index]),
+                    float(match_frac_i[edge_index]),
+                    current.frame_id - candidate.frame_id,
+                    self.cfg["min_match_frac"],
+                    min_match_frac,
+                ):
+                    invalid_edges[edge_index] = False
 
         if bool(self.cfg.get("metric_loop_gate", False)):
             for edge_index, consecutive in enumerate(consecutive_edges.tolist()):

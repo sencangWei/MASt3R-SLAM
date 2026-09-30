@@ -69,12 +69,29 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
             kf_idx = list(kf_idx)  # convert to list
             frame_idx = [n_kf - 1] * len(kf_idx)
             print("RELOCALIZING against kf ", n_kf - 1, " and ", kf_idx)
-            if factor_graph.add_factors(
+            relocalized = factor_graph.add_factors(
                 frame_idx,
                 kf_idx,
                 config["reloc"]["min_match_frac"],
                 is_reloc=config["reloc"]["strict"],
-            ):
+            )
+            anchor_idx = kf_idx[0]
+            # A bad retrieval in the top-k batch must not veto a different,
+            # geometrically valid candidate. Keep the legacy batch unchanged
+            # unless this explicit recovery experiment is enabled.
+            if not relocalized and os.environ.get("MAST3R_RELOC_RETRY_CANDIDATES") == "1":
+                for candidate in kf_idx:
+                    if factor_graph.add_factors(
+                        [n_kf - 1],
+                        [candidate],
+                        config["reloc"]["min_match_frac"],
+                        is_reloc=True,
+                    ):
+                        relocalized = True
+                        anchor_idx = candidate
+                        print("Relocalized with individual candidate", candidate)
+                        break
+            if relocalized:
                 retrieval_database.update(
                     frame,
                     add_after_query=True,
@@ -83,7 +100,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
                 )
                 print("Success! Relocalized")
                 successful_loop_closure = True
-                keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
+                keyframes.T_WC[n_kf - 1] = keyframes.T_WC[anchor_idx].clone()
             else:
                 keyframes.pop_last()
                 print("Failed to relocalize")
