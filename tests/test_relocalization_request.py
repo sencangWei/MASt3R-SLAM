@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from main import raise_if_backend_exited, relocalization
+from main import raise_if_backend_exited, relocalization, tracked_pose_anchor
 from mast3r_slam.config import config
 from mast3r_slam.frame import SharedStates
 from mast3r_slam.global_opt import local_asymmetric_reloc_valid
@@ -26,6 +26,11 @@ def test_backend_failure_is_reported_instead_of_waiting_forever():
     raise_if_backend_exited(SimpleNamespace(exitcode=None))
     with pytest.raises(RuntimeError, match="exit code 1"):
         raise_if_backend_exited(SimpleNamespace(exitcode=1))
+
+
+def test_tracking_pose_uses_new_keyframe_anchor_or_retry_reference():
+    assert tracked_pose_anchor(29, True, 27) == 29
+    assert tracked_pose_anchor(28, False, 27) == 27
 
 
 @pytest.mark.parametrize("retry,expected,anchor", [(False, False, None), (True, True, 2)])

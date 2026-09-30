@@ -41,6 +41,10 @@ def raise_if_backend_exited(backend):
         raise RuntimeError(f"MASt3R backend exited with exit code {backend.exitcode}")
 
 
+def tracked_pose_anchor(last_keyframe_index, add_new_kf, tracking_anchor_idx):
+    return last_keyframe_index if add_new_kf else tracking_anchor_idx
+
+
 def apply_rotation_prior(T_WC, quaternion_xyzw):
     delta_data = torch.zeros((1, 8), dtype=T_WC.data.dtype, device=T_WC.data.device)
     delta_data[:, 3:7] = torch.as_tensor(
@@ -515,6 +519,7 @@ if __name__ == "__main__":
 
         add_new_kf = False
         tracked = False
+        tracking_anchor_idx = len(keyframes) - 1
         if mode == Mode.TRACKING:
             diagnostic_depth = (
                 dataset.get_stereo_depth(i, (h, w))
@@ -523,6 +528,30 @@ if __name__ == "__main__":
             add_new_kf, match_info, try_reloc = tracker.track(
                 frame, diagnostic_depth=diagnostic_depth
             )
+            if (
+                try_reloc
+                and os.environ.get("MAST3R_TRACK_PREVIOUS_KF_RETRY") == "1"
+                and len(keyframes) > 1
+                and i - keyframes[len(keyframes) - 2].frame_id <= 8
+            ):
+                previous_idx = len(keyframes) - 2
+                retry_frame = create_frame(
+                    i, img, T_WC, img_size=dataset.img_size,
+                    device=device, metric_depth=metric_depth,
+                )
+                tracker.reset_idx_f2k()
+                _, _, retry_reloc = tracker.track(
+                    retry_frame,
+                    diagnostic_depth=diagnostic_depth,
+                    reference_keyframe_index=previous_idx,
+                    update_reference=False,
+                )
+                tracker.reset_idx_f2k()
+                if not retry_reloc:
+                    frame = retry_frame
+                    try_reloc = False
+                    tracking_anchor_idx = previous_idx
+                    print(f"Recovered frame {i} using previous keyframe {previous_idx}")
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             else:
@@ -562,7 +591,9 @@ if __name__ == "__main__":
                         break
                 time.sleep(0.01)
         if tracked:
-            anchor_idx = len(keyframes) - 1
+            anchor_idx = tracked_pose_anchor(
+                len(keyframes) - 1, add_new_kf, tracking_anchor_idx
+            )
             if add_new_kf:
                 relative_pose = lietorch.Sim3.Identity(1)
             else:

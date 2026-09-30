@@ -390,8 +390,18 @@ class FrameTracker:
         pose_data[:, 7] = 1.0
         return lietorch.Sim3(pose_data), report
 
-    def track(self, frame: Frame, diagnostic_depth=None):
-        keyframe = self.keyframes.last_keyframe()
+    def track(
+        self,
+        frame: Frame,
+        diagnostic_depth=None,
+        reference_keyframe_index=None,
+        update_reference=True,
+    ):
+        keyframe = (
+            self.keyframes.last_keyframe()
+            if reference_keyframe_index is None
+            else self.keyframes[reference_keyframe_index]
+        )
         rotation_prior_pose = frame.T_WC
 
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
@@ -729,6 +739,11 @@ class FrameTracker:
                     f"{float(torch.linalg.vector_norm(T_CkCf.data[..., :3]).item())},"
                     f"{float(T_CkCf.data[..., 7].item())}\n"
                 )
+
+        # A short-window retry may use an older keyframe only to recover this
+        # frame's pose. It must not rewrite that keyframe or create graph edges.
+        if not update_reference:
+            return False, [], False
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
