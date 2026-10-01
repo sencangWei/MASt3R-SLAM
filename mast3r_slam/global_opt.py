@@ -17,6 +17,23 @@ from mast3r_slam.stereo_depth import (
 import mast3r_slam_backends
 
 
+def save_graph_snapshot_if_requested(frame_ids, args):
+    """Capture exact calibrated-GN inputs for one offline, default-off replay."""
+    requested = os.environ.get("MAST3R_GRAPH_SNAPSHOT_FRAME")
+    if requested is None or not frame_ids or str(frame_ids[-1]) != requested:
+        return False
+    path = os.environ.get("MAST3R_GRAPH_SNAPSHOT_PATH")
+    if not path:
+        raise ValueError("MAST3R_GRAPH_SNAPSHOT_PATH is required for a graph snapshot")
+    frozen = tuple(
+        value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+        for value in args
+    )
+    with open(path, "xb") as stream:
+        torch.save({"frame_ids": frame_ids, "args": frozen}, stream)
+    return True
+
+
 def local_asymmetric_reloc_valid(
     forward_frac, reverse_frac, source_frame_gap, local_min_frac, reloc_min_frac
 ):
@@ -410,6 +427,11 @@ class FactorGraph:
             height, width, pixel_border, z_eps, sigma_pixel, sigma_depth,
             C_thresh, Q_thresh, max_iter, delta_thresh,
         )
+        if os.environ.get("MAST3R_GRAPH_SNAPSHOT_FRAME") is not None:
+            if self.metric_keyframe_prior is not None:
+                raise ValueError("graph snapshot replay does not support metric keyframe priors")
+            frame_ids = [int(self.frames[index].frame_id) for index in unique_kf_idx]
+            save_graph_snapshot_if_requested(frame_ids, args)
         if self.metric_keyframe_prior is None:
             mast3r_slam_backends.gauss_newton_calib(*args)
         else:
