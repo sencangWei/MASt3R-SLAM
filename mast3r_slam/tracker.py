@@ -210,6 +210,7 @@ class FrameTracker:
         self.vins_visual_anchor = None
         self.vins_pose_anchor = None
         self.stereo_imu_anchor = None
+        self.spatial_recovery_rotations = None
         self.vins_translation_prior_sigma_m = float(
             self.cfg.get("vins_translation_prior_sigma_m", 0.0)
         )
@@ -235,6 +236,9 @@ class FrameTracker:
             depth_getter=depth_getter,
             depth_cache={},
         )
+
+    def configure_spatial_pointmap_recovery(self, increments):
+        self.spatial_recovery_rotations = integrate_imu_rotations(increments)
 
     @torch.inference_mode()
     def recover_stereo_descriptor(self, frame, previous_frame, camera_matrix,
@@ -469,9 +473,18 @@ class FrameTracker:
         )
         rotation_prior_pose = frame.T_WC
 
+        imu_relative = None
+        if self.spatial_recovery_rotations is not None:
+            rotations = self.spatial_recovery_rotations
+            imu_relative = (
+                rotations[frame.frame_id].inv() * rotations[keyframe.frame_id]
+            ).as_quat()
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
             self.model, frame, keyframe, idx_i2j_init=self.idx_f2k,
             metric_distance_m=float(self.cfg.get("metric_match_distance_m", 0.0)),
+            weak_stereo_recovery=self.spatial_recovery_rotations is not None,
+            camera_matrix=keyframe.K,
+            imu_relative_quaternion=imu_relative,
         )
         (Xff, Xkf), stereo_scale_report = self.scale_pointmaps(
             (Xff, Xkf), Cff,

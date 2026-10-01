@@ -208,7 +208,8 @@ def mast3r_asymmetric_inference(model, frame_i, frame_j):
 
 
 def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None,
-                            metric_distance_m=0.0):
+                            metric_distance_m=0.0, weak_stereo_recovery=False,
+                            camera_matrix=None, imu_relative_quaternion=None):
     X, C, D, Q = mast3r_asymmetric_inference(model, frame_i, frame_j)
 
     b, h, w = X.shape[:-1]
@@ -235,6 +236,48 @@ def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None,
         Xii, Xji, Dii, Dji, idx_1_to_2_init=idx_i2j_init,
         metric_distance_m=metric_distance_m, metric_scale=metric_scale,
     )
+
+    if (weak_stereo_recovery and b == 1
+            and float(valid_match_j.float().mean()) < config["tracking"]["min_match_frac"]
+            and frame_i.metric_depth is not None and frame_j.metric_depth is not None
+            and camera_matrix is not None and imu_relative_quaternion is not None):
+        from mast3r.fast_nn import fast_reciprocal_NNs
+        from mast3r_slam.stereo_descriptor_recovery import (
+            imu_rotation_agrees, metric_descriptor_pose,
+        )
+        from mast3r_slam.stereo_pointmap_recovery import condition_pair
+
+        source_xy, target_xy = fast_reciprocal_NNs(
+            Dii[0], Dji[0], subsample_or_initxy1=8,
+            device=X.device, dist="dot", block_size=8192,
+        )
+        K = camera_matrix.detach().cpu().numpy()
+        pose, scale, report = metric_descriptor_pose(
+            source_xy, target_xy, frame_i.metric_depth, frame_j.metric_depth,
+            Xii[0, ..., 2].detach().cpu().numpy(),
+            Cii[0].detach().cpu().numpy(), K, minimum_confidence=1.0,
+        )
+        if pose is not None:
+            agrees, angle_deg = imu_rotation_agrees(pose, imu_relative_quaternion)
+            report["imu_rotation_difference_deg"] = angle_deg
+            if agrees:
+                corrected, depth_report = condition_pair(
+                    X.detach().cpu().numpy(), C.detach().cpu().numpy(),
+                    (frame_i.metric_depth, frame_j.metric_depth), pose, scale, K,
+                    source_xy, target_xy,
+                )
+                report["spatial_depth"] = depth_report
+                if corrected is not None:
+                    candidate_X = torch.as_tensor(corrected, device=X.device, dtype=X.dtype)
+                    candidate_idx, candidate_valid = matching.match(
+                        candidate_X[0:1], candidate_X[1:2], Dii, Dji,
+                    )
+                    if float(candidate_valid.float().mean()) >= config["tracking"]["min_match_frac"]:
+                        X = candidate_X
+                        idx_i2j, valid_match_j = candidate_idx, candidate_valid
+                        report["recovered_match_fraction"] = float(candidate_valid.float().mean())
+        print("Stereo-conditioned MASt3R pointmaps", frame_i.frame_id,
+              frame_j.frame_id, report, flush=True)
 
     # How rest of system expects it
     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")

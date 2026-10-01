@@ -392,6 +392,9 @@ if __name__ == "__main__":
     use_metric_match_gate = float(
         config["tracking"].get("metric_match_distance_m", 0.0)
     ) > 0.0
+    use_spatial_pointmap_recovery = (
+        os.environ.get("MAST3R_SPATIAL_POINTMAP_RECOVERY") == "1"
+    )
     trace_frontend = bool(os.environ.get("MAST3R_FRONTEND_LOG"))
     if trace_frontend and dataset.stereo_depth_provider is None:
         raise ValueError("MAST3R_FRONTEND_LOG requires exported stereo-right images")
@@ -403,13 +406,15 @@ if __name__ == "__main__":
         print("Using calibrated IMU rotation priors for frame initialization")
     h, w = dataset.get_img_shape()[0]
     if (
-        use_stereo_pointmap_scale or use_metric_match_gate
+        use_stereo_pointmap_scale or use_metric_match_gate or use_spatial_pointmap_recovery
     ) and dataset.stereo_depth_provider is None:
         raise ValueError(
             "stereo metric tracking requires exported stereo-right images"
         )
     if use_stereo_pointmap_scale:
         print("Using synchronized D405 stereo pointmap scale priors")
+    if use_spatial_pointmap_recovery and dataset.rotation_priors is None:
+        raise ValueError("spatial pointmap recovery requires onboard IMU priors")
 
     if args.calib:
         with open(args.calib, "r") as f:
@@ -462,6 +467,10 @@ if __name__ == "__main__":
             recon_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
+    if use_spatial_pointmap_recovery:
+        if K is None:
+            raise ValueError("spatial pointmap recovery requires calibrated camera intrinsics")
+        tracker.configure_spatial_pointmap_recovery(dataset.rotation_priors)
     if config["tracking"].get("stereo_imu_anchor_guard", False):
         if dataset.rotation_priors is None:
             raise ValueError("stereo/IMU anchor correction requires IMU rotation priors")
@@ -515,7 +524,8 @@ if __name__ == "__main__":
             T_WC = apply_rotation_prior(T_WC, dataset.get_rotation_prior(i))
         metric_depth = (
             dataset.get_stereo_depth(i, (h, w))
-            if use_stereo_pointmap_scale or use_metric_match_gate else None
+            if use_stereo_pointmap_scale or use_metric_match_gate
+            or use_spatial_pointmap_recovery else None
         )
         frame = create_frame(
             i,
