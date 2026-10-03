@@ -1,4 +1,6 @@
+import importlib.util
 import os
+from pathlib import Path
 
 import lietorch
 import numpy as np
@@ -73,6 +75,19 @@ class FactorGraph:
             self.metric_scale_sigma = float(config["tracking"].get("vins_backend_log_scale_sigma", 0.05))
             if self.metric_scale_sigma <= 0.0:
                 raise ValueError("vins_backend_log_scale_sigma must be positive")
+        self.metric_relative_joint_solver = None
+        if bool(config["tracking"].get("metric_relative_joint", False)):
+            if self.metric_keyframe_prior is not None or self.cfg["pin"] != 1 or self.K is None:
+                raise ValueError("metric relative joint requires calibrated pin1 without VINS backend priors")
+            if bool(config["tracking"].get("stereo_fix_pose_scale", False)):
+                raise ValueError("metric relative joint does not support post-solve scale forcing")
+            path = os.environ.get("MAST3R_METRIC_RELATIVE_JOINT_ADAPTER")
+            if not path or not Path(path).is_absolute() or not Path(path).is_file():
+                raise ValueError("metric relative joint requires an explicit absolute adapter file")
+            spec = importlib.util.spec_from_file_location("umi_metric_relative_joint_adapter", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.metric_relative_joint_solver = module.solve_calibrated
 
     def _metric_pnp_direction(
         self, source_frame, target_frame, target_to_source_index, valid_target
@@ -432,7 +447,13 @@ class FactorGraph:
                 raise ValueError("graph snapshot replay does not support metric keyframe priors")
             frame_ids = [int(self.frames[index].frame_id) for index in unique_kf_idx]
             save_graph_snapshot_if_requested(frame_ids, args)
-        if self.metric_keyframe_prior is None:
+        if self.metric_relative_joint_solver is not None:
+            frame_ids = [int(self.frames[index].frame_id) for index in unique_kf_idx]
+            solved = self.metric_relative_joint_solver(frame_ids, args)
+            if solved.shape != pose_data.shape or not torch.isfinite(solved).all():
+                raise ValueError("metric relative joint returned invalid poses")
+            pose_data.copy_(solved.to(device=pose_data.device, dtype=pose_data.dtype))
+        elif self.metric_keyframe_prior is None:
             mast3r_slam_backends.gauss_newton_calib(*args)
         else:
             frame_ids = [int(self.frames[index].frame_id) for index in unique_kf_idx]

@@ -205,9 +205,12 @@ def compute_stereo_depth(
     maximum_depth_m: float,
     num_disparities: int = 128,
     consistency_tolerance_px: float = 1.0,
+    reference_eye: str = "left",
 ) -> np.ndarray:
     if left.ndim != 2 or right.ndim != 2 or left.shape != right.shape:
         raise ValueError("stereo images must be matching grayscale arrays")
+    if reference_eye not in ("left", "right"):
+        raise ValueError("reference_eye must be 'left' or 'right'")
     num_disparities = max(16, int(np.ceil(num_disparities / 16.0)) * 16)
     common = dict(
         numDisparities=num_disparities,
@@ -230,16 +233,27 @@ def compute_stereo_depth(
 
     height, width = left.shape
     y, x = np.indices((height, width))
-    right_x = np.rint(x - disparity_left).astype(np.int32)
-    inside = (right_x >= 0) & (right_x < width) & (disparity_left > 0.5)
-    sampled_right = np.full(left.shape, np.nan, dtype=np.float32)
-    sampled_right[inside] = disparity_right[y[inside], right_x[inside]]
-    valid = inside & (
-        np.abs(disparity_left + sampled_right) <= consistency_tolerance_px
-    )
+    if reference_eye == "left":
+        disparity = disparity_left
+        partner_x = np.rint(x - disparity).astype(np.int32)
+        inside = (partner_x >= 0) & (partner_x < width) & (disparity > 0.5)
+        sampled_partner = np.full(left.shape, np.nan, dtype=np.float32)
+        sampled_partner[inside] = disparity_right[y[inside], partner_x[inside]]
+        valid = inside & (
+            np.abs(disparity + sampled_partner) <= consistency_tolerance_px
+        )
+    else:
+        disparity = -disparity_right
+        partner_x = np.rint(x + disparity).astype(np.int32)
+        inside = (partner_x >= 0) & (partner_x < width) & (disparity > 0.5)
+        sampled_partner = np.full(left.shape, np.nan, dtype=np.float32)
+        sampled_partner[inside] = disparity_left[y[inside], partner_x[inside]]
+        valid = inside & (
+            np.abs(disparity - sampled_partner) <= consistency_tolerance_px
+        )
 
     depth = np.full(left.shape, np.nan, dtype=np.float32)
-    depth[valid] = focal_length_px * baseline_m / disparity_left[valid]
+    depth[valid] = focal_length_px * baseline_m / disparity[valid]
     valid &= (depth >= minimum_depth_m) & (depth <= maximum_depth_m)
     depth[~valid] = np.nan
     return depth
@@ -351,9 +365,34 @@ def scale_pointmaps_with_metric_depth(
 class StereoDepthProvider:
     def __init__(self, dataset_path: Path, metadata: dict):
         self.dataset_path = dataset_path
-        self.right_directory = dataset_path / metadata["right_directory"]
-        self.focal_length_px = float(metadata["left_focal_length_px"])
+        self.reference_eye = metadata.get("reference_eye", "left")
+        if self.reference_eye not in ("left", "right"):
+            raise ValueError("stereo_depth_source reference_eye must be 'left' or 'right'")
         self.baseline_m = float(metadata["baseline_m"])
+        if not np.isfinite(self.baseline_m) or self.baseline_m <= 0.0:
+            raise ValueError("stereo_depth_source baseline_m must be positive")
+        if self.reference_eye == "left":
+            if "right_directory" not in metadata or "left_focal_length_px" not in metadata:
+                raise ValueError("left reference stereo depth requires right_directory and left_focal_length_px")
+            self.paired_directory = dataset_path / metadata["right_directory"]
+            self.focal_length_px = float(metadata["left_focal_length_px"])
+        else:
+            if "left_directory" not in metadata:
+                raise ValueError("right reference stereo depth requires left_directory")
+            self.paired_directory = dataset_path / metadata["left_directory"]
+            right_camera = metadata.get("right_camera_info")
+            if not isinstance(right_camera, dict):
+                raise ValueError("right reference stereo depth requires right_camera_info")
+            coeffs = right_camera.get("coeffs", [])
+            if any(float(value) != 0.0 for value in coeffs):
+                raise ValueError("right reference stereo depth requires rectified zero-distortion images")
+            self.focal_length_px = float(right_camera["fx"])
+            for key in ("fx", "fy", "ppx", "ppy"):
+                value = float(right_camera[key])
+                if not np.isfinite(value):
+                    raise ValueError(f"right_camera_info {key} must be finite")
+            if not np.isfinite(self.focal_length_px) or self.focal_length_px <= 0.0:
+                raise ValueError("right_camera_info fx must be positive")
         self.minimum_depth_m = float(metadata.get("minimum_depth_m", 0.15))
         self.maximum_depth_m = float(metadata.get("maximum_depth_m", 0.65))
 
@@ -366,12 +405,16 @@ class StereoDepthProvider:
         stereo = manifest.get("stereo_depth_source")
         return cls(dataset_path, stereo) if stereo else None
 
-    def get_depth(self, left_path: Path, target_shape: tuple[int, int]) -> np.ndarray:
-        left = cv2.imread(str(left_path), cv2.IMREAD_GRAYSCALE)
-        right_path = self.right_directory / left_path.name
-        right = cv2.imread(str(right_path), cv2.IMREAD_GRAYSCALE)
+    def get_depth(self, reference_path: Path, target_shape: tuple[int, int]) -> np.ndarray:
+        reference = cv2.imread(str(reference_path), cv2.IMREAD_GRAYSCALE)
+        paired_path = self.paired_directory / reference_path.name
+        paired = cv2.imread(str(paired_path), cv2.IMREAD_GRAYSCALE)
+        if self.reference_eye == "left":
+            left, right = reference, paired
+        else:
+            left, right = paired, reference
         if left is None or right is None:
-            raise FileNotFoundError(f"missing stereo pair for {left_path.name}")
+            raise FileNotFoundError(f"missing stereo pair for {reference_path.name}")
         depth = compute_stereo_depth(
             left,
             right,
@@ -379,6 +422,7 @@ class StereoDepthProvider:
             self.baseline_m,
             self.minimum_depth_m,
             self.maximum_depth_m,
+            reference_eye=self.reference_eye,
         )
         target_height, target_width = target_shape
         if depth.shape != target_shape:
