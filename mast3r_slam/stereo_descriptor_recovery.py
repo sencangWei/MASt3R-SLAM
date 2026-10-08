@@ -14,6 +14,20 @@ from mast3r_slam.stereo_depth import (
 )
 
 
+def descriptor_relative_translation(metric_translation, *, pointmap_scale,
+                                    previous_world_scale, metric_world):
+    """Convert measured meters to the persistent Sim(3) camera units.
+
+    In a metric world, composition multiplies by the previous pose's scale.
+    The raw pair decoder scale describes a new pointmap, not that pose frame.
+    Nonmetric tracking retains its original model-coordinate conversion.
+    """
+    divisor = previous_world_scale if metric_world else pointmap_scale
+    if not np.isfinite(divisor) or divisor <= 0.0:
+        raise ValueError("descriptor recovery pose scale must be positive and finite")
+    return np.asarray(metric_translation, dtype=np.float64) / divisor
+
+
 def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
                            source_pointmap_z, source_confidence, camera_matrix,
                            minimum_confidence=1.5):

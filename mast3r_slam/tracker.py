@@ -29,6 +29,7 @@ from mast3r_slam.stereo_depth import (
 )
 from mast3r_slam.stereo_imu_anchor import integrate_imu_rotations, propose_anchor_pose
 from mast3r_slam.stereo_descriptor_recovery import (
+    descriptor_relative_translation,
     imu_rotation_agrees,
     metric_descriptor_pose,
 )
@@ -289,9 +290,17 @@ class FrameTracker:
             return dict(report, accepted=False, reason="motion_prior_disagreement")
         relative = np.linalg.inv(pose)
         quaternion = Rotation.from_matrix(relative[:3, :3]).as_quat()
+        metric_world = bool(self.cfg.get("stereo_pointmap_scale_prior", False))
+        world_scale = float(previous_frame.T_WC.data[0, 7].item())
+        relative_translation = descriptor_relative_translation(
+            relative[:3, 3], pointmap_scale=scale,
+            previous_world_scale=world_scale, metric_world=metric_world,
+        )
+        report["translation_unit_policy"] = "metric_world_pose_scale" if metric_world else "model_pointmap_scale"
+        report["previous_world_scale"] = world_scale
         pose_data = frame.T_WC.data.new_zeros((1, 8))
         pose_data[0, :3] = torch.as_tensor(
-            relative[:3, 3] / scale, device=self.device, dtype=pose_data.dtype
+            relative_translation, device=self.device, dtype=pose_data.dtype
         )
         pose_data[0, 3:7] = torch.as_tensor(
             quaternion, device=self.device, dtype=pose_data.dtype

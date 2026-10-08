@@ -4,7 +4,26 @@ from scipy.spatial.transform import Rotation
 from mast3r_slam.stereo_descriptor_recovery import (
     imu_rotation_agrees,
     metric_descriptor_pose,
+    descriptor_relative_translation,
 )
+
+
+def test_metric_recovery_composition_preserves_meter_displacement():
+    delta = np.array([0.0037, -0.002, 0.001])
+    for world_scale in (1.0, 0.8, 1.3):
+        relative = descriptor_relative_translation(
+            delta, pointmap_scale=0.064, previous_world_scale=world_scale,
+            metric_world=True,
+        )
+        np.testing.assert_allclose(world_scale * relative, delta)
+
+
+def test_nonmetric_recovery_keeps_original_pointmap_units():
+    delta = np.array([0.0037, 0.0, 0.0])
+    np.testing.assert_allclose(descriptor_relative_translation(
+        delta, pointmap_scale=0.064, previous_world_scale=1.0,
+        metric_world=False,
+    ), delta / 0.064)
 
 
 def test_metric_descriptor_pose_accepts_consistent_stereo_motion():
