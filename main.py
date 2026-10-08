@@ -26,6 +26,7 @@ from mast3r_slam.mast3r_utils import (
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
+from mast3r_slam.temporal_descriptor_anchors import RecentDescriptorAnchors
 import torch.multiprocessing as mp
 
 
@@ -488,6 +489,17 @@ if __name__ == "__main__":
     frames = []
     tracked_poses = []
     online_poses = []
+    descriptor_anchors = RecentDescriptorAnchors() if descriptor_recovery else None
+
+    def recover_from_recent_anchors(frame):
+        frame.metric_depth = dataset.get_stereo_depth(frame.frame_id, (h, w))
+
+        def attempt(anchor, rotation_prior):
+            if anchor.metric_depth is None:
+                anchor.metric_depth = dataset.get_stereo_depth(anchor.frame_id, (h, w))
+            return tracker.recover_stereo_descriptor(frame, anchor, recovery_K, rotation_prior)
+
+        return descriptor_anchors.recover(frame.frame_id, dataset.rotation_priors, attempt)
 
     while True:
         raise_if_backend_exited(backend)
@@ -552,6 +564,8 @@ if __name__ == "__main__":
                 (frame.frame_id, 0, lietorch.Sim3.Identity(1).data.cpu())
             )
             online_poses.append((frame.frame_id, frame.T_WC.data.detach().cpu()))
+            if descriptor_recovery:
+                descriptor_anchors.accept(frame)
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
@@ -595,18 +609,11 @@ if __name__ == "__main__":
                     print(f"Recovered frame {i} using previous keyframe {previous_idx}")
             if try_reloc:
                 if descriptor_recovery:
-                    previous_frame = states.get_frame()
-                    previous_frame.metric_depth = dataset.get_stereo_depth(
-                        previous_frame.frame_id, (h, w)
-                    )
-                    frame.metric_depth = dataset.get_stereo_depth(i, (h, w))
-                    report = tracker.recover_stereo_descriptor(
-                        frame, previous_frame, recovery_K,
-                        dataset.get_rotation_prior(i),
-                    )
+                    report = recover_from_recent_anchors(frame)
                     print("Stereo descriptor recovery", i, report)
                     if report["accepted"]:
                         try_reloc = False
+                        add_new_kf = False
                 if try_reloc:
                     states.set_mode(Mode.RELOC)
             if not try_reloc:
@@ -614,24 +621,32 @@ if __name__ == "__main__":
             states.set_frame(frame)
 
         elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
-            (X,), stereo_scale_report = tracker.scale_pointmaps(
-                (X,), C,
-                frame.metric_depth if use_stereo_pointmap_scale else None,
-            )
-            frame.metric_anchor_mask = tracker.last_metric_anchor_mask
-            if use_stereo_pointmap_scale:
-                print("Stereo pointmap scale", frame.frame_id, stereo_scale_report)
-            frame.update_pointmap(X, C)
-            states.set_frame(frame)
-            states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
-            while config["single_thread"]:
-                raise_if_backend_exited(backend)
-                with states.lock:
-                    if states.reloc_sem.value == 0:
-                        break
-                time.sleep(0.01)
+            if descriptor_recovery:
+                report = recover_from_recent_anchors(frame)
+                print("Stereo descriptor relocalization recovery", i, report)
+                if report["accepted"]:
+                    tracked = True
+                    states.set_mode(Mode.TRACKING)
+                    states.set_frame(frame)
+            if not tracked:
+                X, C = mast3r_inference_mono(model, frame)
+                (X,), stereo_scale_report = tracker.scale_pointmaps(
+                    (X,), C,
+                    frame.metric_depth if use_stereo_pointmap_scale else None,
+                )
+                frame.metric_anchor_mask = tracker.last_metric_anchor_mask
+                if use_stereo_pointmap_scale:
+                    print("Stereo pointmap scale", frame.frame_id, stereo_scale_report)
+                frame.update_pointmap(X, C)
+                states.set_frame(frame)
+                states.queue_reloc()
+                # In single threaded mode, ensure relocalization runs for every frame.
+                while config["single_thread"]:
+                    raise_if_backend_exited(backend)
+                    with states.lock:
+                        if states.reloc_sem.value == 0:
+                            break
+                    time.sleep(0.01)
 
         else:
             raise Exception("Invalid mode")
@@ -658,6 +673,8 @@ if __name__ == "__main__":
                 (frame.frame_id, anchor_idx, relative_pose.data.detach().cpu())
             )
             online_poses.append((frame.frame_id, frame.T_WC.data.detach().cpu()))
+            if descriptor_recovery:
+                descriptor_anchors.accept(frame)
         elif mode == Mode.RELOC and states.get_mode() == Mode.TRACKING:
             anchor_idx = len(keyframes) - 1
             anchor = keyframes[anchor_idx]
@@ -666,6 +683,8 @@ if __name__ == "__main__":
                     (frame.frame_id, anchor_idx, lietorch.Sim3.Identity(1).data.cpu())
                 )
                 online_poses.append((frame.frame_id, frame.T_WC.data.detach().cpu()))
+                if descriptor_recovery:
+                    descriptor_anchors.accept(frame)
         # log time
         if i % 30 == 0:
             FPS = i / (time.time() - fps_timer)
