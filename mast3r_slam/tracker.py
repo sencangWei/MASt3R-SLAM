@@ -701,7 +701,11 @@ class FrameTracker:
         graph_for_gate = copy.copy(graph_anchor)
         frame_for_gate = copy.copy(frame)
         for candidate in (graph_for_gate, frame_for_gate):
-            if getattr(candidate, "metric_anchor_mask", None) is None:
+            # Shared graph depth is a CPU tensor; live provider depth is NumPy.
+            # PnP indexes both on CPU, without rewriting either original frame.
+            candidate.metric_depth = torch.as_tensor(candidate.metric_depth, device="cpu")
+            mask = getattr(candidate, "metric_anchor_mask", None)
+            if mask is None or not bool(torch.as_tensor(mask).any()):
                 depth = torch.as_tensor(candidate.metric_depth, device=idx_i2j.device)
                 candidate.metric_anchor_mask = torch.isfinite(depth.reshape(-1)) & (
                     depth.reshape(-1) > 0.0

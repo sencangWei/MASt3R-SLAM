@@ -453,7 +453,8 @@ def test_metric_bridge_edges_do_not_get_consecutive_edge_exemption(monkeypatch):
     assert not bridge.add_factors([0], [1], min_match_frac=0.5)
 
 
-def test_reentry_metric_bridge_uses_temporary_depth_masks(monkeypatch):
+@pytest.mark.parametrize("shared_empty_mask", [False, True])
+def test_reentry_metric_bridge_uses_temporary_depth_masks(monkeypatch, shared_empty_mask):
     import mast3r_slam.global_opt as global_module
     import mast3r_slam.tracker as tracker_module
 
@@ -465,7 +466,7 @@ def test_reentry_metric_bridge_uses_temporary_depth_masks(monkeypatch):
     def good_symmetric(*args, **kwargs):
         idx = torch.arange(4, dtype=torch.long).reshape(1, 4)
         valid = torch.ones((1, 4, 1), dtype=torch.bool)
-        quality = torch.ones((1, 4))
+        quality = torch.ones((1, 4, 1))
         return idx, idx, valid, valid, quality, quality, quality, quality
 
     def metric_gate(self, source, target, *args):
@@ -482,7 +483,7 @@ def test_reentry_metric_bridge_uses_temporary_depth_masks(monkeypatch):
         pos=torch.zeros((1, 4, 2), dtype=torch.long),
         img_true_shape=torch.tensor([[2, 2]]),
         metric_depth=np.ones((2, 2), dtype=np.float32),
-        metric_anchor_mask=None,
+        metric_anchor_mask=torch.zeros(4, dtype=torch.bool) if shared_empty_mask else None,
         K=torch.eye(3),
     )
     accepted, report = tracker.metric_bridge_gate(
@@ -491,6 +492,44 @@ def test_reentry_metric_bridge_uses_temporary_depth_masks(monkeypatch):
     )
     assert accepted
     assert report["reason"] == "metric_bridge_accepted"
+    original_mask = common["metric_anchor_mask"]
+    assert original_mask is None or not bool(original_mask.any())
+
+
+def test_reentry_metric_bridge_runs_both_pnp_directions_with_provider_numpy_depth(monkeypatch):
+    import mast3r_slam.global_opt as global_module
+    import mast3r_slam.tracker as tracker_module
+
+    tracker, _ = tracker_and_frames()
+    tracker.cfg.update(Q_conf=0.0, min_match_frac=0.5)
+    monkeypatch.setitem(tracker_module.config, "use_calib", True)
+    idx = torch.arange(4, dtype=torch.long).reshape(1, 4)
+    valid = torch.ones((1, 4, 1), dtype=torch.bool)
+    quality = torch.ones((1, 4, 1))
+    monkeypatch.setattr(tracker_module, "mast3r_match_symmetric",
+                        lambda *args: (idx, idx, valid, valid, quality, quality, quality, quality))
+    pnp_calls = []
+
+    def pnp(object_points, image_points, camera_matrix, **kwargs):
+        pnp_calls.append(object_points)
+        assert object_points.shape == (4, 3)
+        return np.eye(4), {"accepted": True, "reprojection_p95_px": 0.0}
+
+    monkeypatch.setattr(global_module, "solve_metric_keyframe_pnp", pnp)
+    depth = np.ones((2, 2), dtype=np.float32)
+    common = dict(
+        feat=torch.zeros((1, 4, 2)), pos=torch.zeros((1, 4, 2), dtype=torch.long),
+        img=torch.zeros((3, 2, 2)), img_true_shape=torch.tensor([[2, 2]]),
+        metric_depth=depth, metric_anchor_mask=torch.zeros(4, dtype=torch.bool),
+        K=torch.eye(3),
+    )
+    source = SimpleNamespace(frame_id=0, **common)
+    target = SimpleNamespace(frame_id=1, **common)
+    accepted, report = tracker.metric_bridge_gate(source, target)
+    assert accepted, report
+    assert len(pnp_calls) == 2
+    assert source.metric_depth is depth and target.metric_depth is depth
+    assert not bool(source.metric_anchor_mask.any())
 
 
 def test_multi_frame_vins_window_rejects_accumulated_same_direction_drift():
