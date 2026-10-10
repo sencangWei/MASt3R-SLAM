@@ -27,15 +27,23 @@ robot, Lighthouse, or evaluation error is read by these decisions.
 - Return to visual tracking only after valid geometry and two distinct,
   consecutive internally consistent frames. The 3-sigma VINS agreement gate
   is **not** the external accuracy threshold or a trajectory correction limit.
+- When the graph reference becomes stale, keep a recent independently
+  stereo-scaled self pointmap as a **local recovery reference**, outside
+  SharedKeyframes. Its pose/maps/intrinsics are copied, and its scale state
+  is isolated from the old graph. After two consistent frames, visual pose
+  estimation can resume against this recent reference. Neither rejected nor
+  recovered local observations write the old graph or create graph edges.
 - Before VINS initialization, retain the existing healthy visual start; there
   is no valid VINS motion to fabricate. Unexpected software errors propagate
   instead of being silently converted to a successful fallback.
 
 ## Verification and known limits
 
-Fresh frontend suite: 61 tests passed, including composition/gauge/scale,
+Fresh frontend suite after local-reference recovery: 65 tests passed, including composition/gauge/scale,
 invalid/absent priors, stationary output, no reference mutation, recovery
-confirmation, expected numerical rejection and unexpected-error propagation.
+confirmation, expected numerical rejection and unexpected-error propagation,
+reference-copy isolation, fresh-reference selection, and a confirmed visual
+recovery path that cannot read/write/append SharedKeyframes.
 
 First actual ind2 right-eye 581-frame prefix experiment (v1): frames 569--580
 were covered by VINS fallback. The world-metric 576->577 step was 2.384 mm;
@@ -46,14 +54,16 @@ states with an actual metric prior. Fresh full replays of ind2, heldout1 and
 heldout4 all emit 1199/1199 poses without missing indices. The ind2 573->574
 step is now 3.200 mm, against 58.879 mm in the former metric-rescue run.
 
-Long pose-only streaks leave the last visual keyframe too old for recovery in
-the full ind2 replay: the last 554 frames remain pose-only. Heldout1's maximum
+Before local-reference recovery, long pose-only streaks left the last visual
+keyframe too old: the full ind2 replay's last 554 frames remained pose-only. Heldout1's maximum
 streak is 83 frames, heldout4's is 203. This is an unresolved mechanism gap,
-not an accepted production result. Independent fused-trajectory ATE regression
-has not been run for this candidate.
+not an accepted production result. New full replays and independent fused
+precision checks are required for the local-reference extension.
 `degraded_frames` is logged. Do not promote a coverage-only VINS stream as
-successful learned-visual recovery. No probationary graph anchor is implemented
-in this minimal candidate. A confirmed new visual anchor must NOT use the
+successful learned-visual recovery. The local recovery reference is NOT a
+probationary graph anchor; graph re-entry is intentionally not implemented.
+Once this reference is active, later poses do not add new loop/keyframe factors.
+A confirmed new graph anchor must NOT use the
 default stale consecutive graph edge: the current backend exempts consecutive
 edges from its match-fraction gate. Graph re-entry therefore needs a tested
 onboard bridge/edge-validation design, not simply appending a fresh frame and

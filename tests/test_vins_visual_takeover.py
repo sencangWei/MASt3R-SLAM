@@ -143,6 +143,114 @@ def test_disabled_takeover_does_not_modify_pose():
     assert torch.equal(frame.T_WC.data, original)
 
 
+def test_recovery_reference_is_independent_of_shared_graph_and_metric_scale(monkeypatch):
+    import mast3r_slam.tracker as module
+    tracker, frame = tracker_and_frames()
+    tracker.metric_pointmap_scale = 4.0
+    tracker.recovery_reference = None
+    tracker.recovery_reference_scale = None
+    frame.metric_depth = np.ones((1, 3))
+    frame.K = torch.eye(3)
+    raw = torch.ones((3, 3))
+    conf = torch.full((3, 1), 2.0)
+    monkeypatch.setattr(module, "scale_pointmaps_with_metric_depth",
+                        lambda *args: ((raw * 2,), {"accepted": True, "scale": 2.0}))
+    monkeypatch.setattr(module, "metric_depth_anchor_mask",
+                        lambda *args: torch.ones(3, dtype=torch.bool))
+    assert tracker.seed_recovery_reference(frame, raw, conf, frame.K)
+    anchor = tracker.recovery_reference
+    assert anchor is not frame
+    assert anchor.frame_id == frame.frame_id
+    assert anchor.K is not frame.K
+    assert tracker.metric_pointmap_scale == 4.0
+    assert tracker.recovery_reference_scale == 2.0
+    frame.T_WC.data[0, 0] = 99
+    conf.fill_(0)
+    assert anchor.T_WC.data[0, 0] != 99
+    assert torch.all(anchor.C == 2)
+    assert torch.all(anchor.X_canon == 2)
+
+
+def test_bad_self_geometry_cannot_replace_the_recovery_reference(monkeypatch):
+    import mast3r_slam.tracker as module
+    tracker, frame = tracker_and_frames()
+    original = object()
+    tracker.recovery_reference = original
+    tracker.recovery_reference_scale = 2.0
+    frame.metric_depth = None
+    monkeypatch.setattr(module, "scale_pointmaps_with_metric_depth",
+                        lambda *args: (args[0], {"accepted": False}))
+    assert not tracker.seed_recovery_reference(frame, torch.ones((3, 3)), torch.ones((3, 1)), None)
+    assert tracker.recovery_reference is original
+    assert tracker.recovery_reference_scale == 2.0
+
+
+def test_takeover_tracks_fresh_reference_instead_of_stale_graph_keyframe(monkeypatch):
+    import mast3r_slam.tracker as module
+    tracker, frame = tracker_and_frames()
+    tracker.spatial_recovery_rotations = None
+    tracker.metric_pointmap_scale = 4.0
+    tracker.model = None
+    shadow = SimpleNamespace(K=torch.eye(3))
+    tracker.recovery_reference = shadow
+    tracker.recovery_reference_scale = 2.0
+    tracker.keyframes = SimpleNamespace(last_keyframe=lambda: object())
+    def match(model, current, reference, **kwargs):
+        assert reference is shadow
+        raise RuntimeError("selected_fresh_reference")
+    monkeypatch.setattr(module, "mast3r_match_asymmetric", match)
+    with pytest.raises(RuntimeError, match="selected_fresh_reference"):
+        tracker.track(frame)
+    assert tracker.metric_pointmap_scale == 4.0
+
+
+def test_confirmed_shadow_visual_pose_never_writes_or_inserts_graph_reference(monkeypatch):
+    import mast3r_slam.tracker as module
+    tracker, frame = tracker_and_frames()
+    tracker.cfg.update(C_conf=0., Q_conf=1.5, min_match_frac=.05,
+                       stereo_scale_min_points=2, C_weight_floor=1.)
+    tracker.vins_degraded = True
+    tracker.spatial_recovery_rotations = None
+    tracker.stereo_imu_anchor = None
+    tracker.metric_pointmap_scale = 4.0
+    tracker.recovery_reference_scale = 2.0
+    tracker.model = None
+    points = torch.tensor([[0., 0., .3], [.01, 0., .3], [0., .01, .3]])
+    confidence = torch.full((3, 1), 2.)
+    shadow = SimpleNamespace(K=torch.eye(3), X_canon=points, C=confidence,
+                             frame_id=0, T_WC=tracker.previous_frame.T_WC)
+    tracker.recovery_reference = shadow
+    tracker.keyframes = object()  # Any graph read/write/append would fail.
+    frame.metric_depth = np.full((1, 3), .3)
+    frame.img = torch.ones((3, 1, 3))
+    frame.update_pointmap = lambda *args: None
+    tracker.last_metric_anchor_mask = torch.ones(3, dtype=torch.bool)
+    monkeypatch.setitem(module.config, "use_calib", False)
+    monkeypatch.setattr(module, "mast3r_match_asymmetric", lambda *args, **kwargs: (
+        torch.arange(3)[None], torch.ones((1, 3, 1), dtype=torch.bool),
+        points, confidence, confidence, points, confidence, confidence,
+    ))
+    tracker.scale_pointmaps = lambda *args: ((points, points), {"accepted": True})
+    monkeypatch.setattr(module, "scale_pointmaps_with_metric_depth",
+                        lambda *args: ((points,), {"accepted": True, "scale": 2.}))
+    monkeypatch.setattr(module, "metric_depth_anchor_mask", lambda *args: torch.ones(3, dtype=torch.bool))
+    tracker.get_points_poses = lambda *args: (
+        points, points, frame.T_WC, shadow.T_WC, confidence, confidence, None, None)
+    tracker.opt_pose_ray_dist_sim3 = lambda *args: (tracker.predict_vins_pose(frame), lietorch.Sim3.Identity(1))
+    assert tracker.track(frame) == (False, [], False)
+    assert frame.pose_only
+    tracker.previous_frame = frame
+    tracker.vins_camera_poses.append(row(2, .004))
+    frame.frame_id = 2
+    # Do not alias the previous-frame index while simulating SharedStates.
+    tracker.previous_frame = SimpleNamespace(frame_id=1, T_WC=frame.T_WC)
+    assert tracker.track(frame) == (False, [], False)
+    assert not frame.pose_only
+    assert not tracker.vins_degraded
+    assert tracker.recovery_reference.frame_id == 2
+    assert tracker.metric_pointmap_scale == 4.0
+
+
 @pytest.mark.parametrize("geometry_accepted,reference_conf", [(False, 2.0), (True, 1.0)])
 def test_unreliable_geometry_returns_before_any_reference_update(monkeypatch, geometry_accepted, reference_conf):
     import mast3r_slam.tracker as module

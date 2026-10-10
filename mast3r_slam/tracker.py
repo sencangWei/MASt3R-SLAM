@@ -3,6 +3,7 @@ import atexit
 import csv
 import json
 import math
+import copy
 
 import torch
 import lietorch
@@ -223,6 +224,8 @@ class FrameTracker:
         self.vins_recovery_frame_id = None
         self.vins_degraded_frames = 0
         self.last_takeover_report = None
+        self.recovery_reference = None
+        self.recovery_reference_scale = None
         self.stereo_imu_anchor = None
         self.spatial_recovery_rotations = None
         self.vins_translation_prior_sigma_m = float(
@@ -280,6 +283,8 @@ class FrameTracker:
             pose_only=bool(getattr(frame, "pose_only", False)),
             recovery_count=self.vins_recovery_count,
             degraded_frames=self.vins_degraded_frames,
+            recovery_reference_id=(None if getattr(self, "recovery_reference", None) is None
+                                   else self.recovery_reference.frame_id),
             external_ground_truth_used=False,
         )
         path = os.environ.get("MAST3R_VINS_TAKEOVER_LOG")
@@ -309,6 +314,32 @@ class FrameTracker:
         if not isinstance(error, (VisualSolveRejected, torch.linalg.LinAlgError)):
             raise error
         return self.recover_vins(frame, "visual_solve_failed:" + str(error))
+
+    def seed_recovery_reference(self, frame, raw_points, confidence, K):
+        """Keep a physically scaled local reference outside the global graph.
+
+        A rejected registration must not overwrite the old graph pointmap.
+        Self geometry can nevertheless seed the next short-baseline attempt.
+        Copies also keep SharedStates.set_frame from changing this reference.
+        """
+        (points,), report = scale_pointmaps_with_metric_depth(
+            (raw_points,), confidence, frame.metric_depth, self.cfg
+        )
+        if not report.get("accepted") or not torch.isfinite(points).all():
+            return False
+        anchor = copy.copy(frame)
+        anchor.T_WC = lietorch.Sim3(frame.T_WC.data.clone())
+        anchor.X_canon = points.clone()
+        anchor.C = confidence.clone()
+        anchor.N = anchor.N_updates = 1
+        anchor.K = None if K is None else K.clone()
+        anchor.metric_anchor_mask = metric_depth_anchor_mask(
+            points, confidence, frame.metric_depth, self.cfg
+        )
+        self.recovery_reference = anchor
+        self.recovery_reference_scale = float(report["scale"])
+        self.reset_idx_f2k()
+        return True
 
     def accept_visual_recovery(self, visual_pose, frame):
         predicted = self.predict_vins_pose(frame)
@@ -602,13 +633,15 @@ class FrameTracker:
         reference_keyframe_index=None,
         update_reference=True,
     ):
-        keyframe = (
+        takeover = bool(self.cfg.get("vins_visual_takeover", False))
+        shadow = getattr(self, "recovery_reference", None) if takeover else None
+        using_shadow = shadow is not None and reference_keyframe_index is None
+        keyframe = shadow if using_shadow else (
             self.keyframes.last_keyframe()
             if reference_keyframe_index is None
             else self.keyframes[reference_keyframe_index]
         )
         rotation_prior_pose = frame.T_WC
-        takeover = bool(self.cfg.get("vins_visual_takeover", False))
         previous_metric_scale = self.metric_pointmap_scale
 
         imu_relative = None
@@ -624,11 +657,18 @@ class FrameTracker:
             camera_matrix=keyframe.K,
             imu_relative_quaternion=imu_relative,
         )
-        (Xff, Xkf), stereo_scale_report = self.scale_pointmaps(
-            (Xff, Xkf), Cff,
-            frame.metric_depth
-            if self.cfg.get("stereo_pointmap_scale_prior", False) else None,
-        )
+        raw_current_points = Xff
+        if using_shadow:
+            self.metric_pointmap_scale = self.recovery_reference_scale
+        try:
+            (Xff, Xkf), stereo_scale_report = self.scale_pointmaps(
+                (Xff, Xkf), Cff,
+                frame.metric_depth
+                if self.cfg.get("stereo_pointmap_scale_prior", False) else None,
+            )
+        finally:
+            if using_shadow:
+                self.metric_pointmap_scale = previous_metric_scale
         frame.metric_anchor_mask = self.last_metric_anchor_mask
         if (
             self.cfg.get("stereo_pointmap_scale_prior", False)
@@ -654,6 +694,8 @@ class FrameTracker:
             if not stereo_scale_report.get("accepted") or reference_support < minimum:
                 self.metric_pointmap_scale = previous_metric_scale
                 accepted = self.recover_vins(frame, "unreliable_pointmap_geometry")
+                if accepted:
+                    self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
                 return False, [], not accepted
 
         use_calib = config["use_calib"]
@@ -711,6 +753,8 @@ class FrameTracker:
             if takeover:
                 self.metric_pointmap_scale = previous_metric_scale
                 accepted = self.recover_vins(frame, "insufficient_visual_matches")
+                if accepted:
+                    self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
                 return False, [], not accepted
             return False, [], True
 
@@ -871,6 +915,8 @@ class FrameTracker:
             if takeover:
                 self.metric_pointmap_scale = previous_metric_scale
                 accepted = self.recover_visual_solve_failure(frame, e)
+                if accepted:
+                    self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
                 return False, [], not accepted
             print(f"Cholesky failed {frame.frame_id}")
             return False, [], True
@@ -947,11 +993,18 @@ class FrameTracker:
                     frame, "visual_vins_consistency_or_recovery_pending",
                     recovery_pending=self.vins_recovery_count > 0,
                 )
+                if accepted:
+                    self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
                 return False, [], not accepted
             frame.pose_only = False
             self.log_takeover(frame, "visual_accepted", True)
 
         frame.T_WC = T_WCf
+        if using_shadow:
+            self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
+            # Recovery observations stay out of SharedKeyframes/retrieval and
+            # cannot introduce an unchecked consecutive edge to the stale map.
+            return False, [], False
         if self.vins_camera_poses is not None and self.vins_visual_anchor is None:
             prior_row = self.vins_camera_poses[frame.frame_id]
             if prior_row["valid"] == "1":
