@@ -1,6 +1,8 @@
 import os
 import atexit
 import csv
+import json
+import math
 
 import torch
 import lietorch
@@ -33,9 +35,14 @@ from mast3r_slam.stereo_descriptor_recovery import (
     imu_rotation_agrees,
     metric_descriptor_pose,
 )
+from mast3r_slam.vins_takeover import propagate_vins_relative_pose
 
 
 _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
+
+
+class VisualSolveRejected(RuntimeError):
+    """Expected numerical rejection, not an arbitrary visual-path defect."""
 _ROBUST_LOG = os.environ.get("MAST3R_ROBUST_LOG", "")
 _FRONTEND_LOG = os.environ.get("MAST3R_FRONTEND_LOG", "")
 _robust_samples = {}  # (width, part) -> list[Tensor]
@@ -210,6 +217,12 @@ class FrameTracker:
         self.vins_camera_poses = None
         self.vins_visual_anchor = None
         self.vins_pose_anchor = None
+        self.previous_frame = None
+        self.vins_degraded = False
+        self.vins_recovery_count = 0
+        self.vins_recovery_frame_id = None
+        self.vins_degraded_frames = 0
+        self.last_takeover_report = None
         self.stereo_imu_anchor = None
         self.spatial_recovery_rotations = None
         self.vins_translation_prior_sigma_m = float(
@@ -227,7 +240,121 @@ class FrameTracker:
                 raise ValueError("VINS camera pose prior indices must be contiguous")
             self.vins_camera_poses = rows
 
+        if self.cfg.get("vins_visual_takeover", False) and self.vins_camera_poses is None:
+            raise ValueError("VINS visual takeover requires metric camera pose priors")
+
         self.reset_idx_f2k()
+
+    def predict_vins_pose(self, frame):
+        previous = self.previous_frame
+        rows = self.vins_camera_poses
+        if previous is None or rows is None or previous.frame_id != frame.frame_id - 1:
+            return None
+        if not 0 <= previous.frame_id < frame.frame_id < len(rows):
+            return None
+        before, after = rows[previous.frame_id], rows[frame.frame_id]
+        if before["valid"] != "1" or after["valid"] != "1":
+            return None
+        try:
+            before_pose, after_pose = self.vins_pose_from_row(before), self.vins_pose_from_row(after)
+            # Same short-frame physical sanity bound as stereo descriptor recovery.
+            if np.linalg.norm(after_pose[:3] - before_pose[:3]) > 0.03:
+                return None
+            data = propagate_vins_relative_pose(
+                previous.T_WC.data[0].detach().cpu().numpy(), before_pose, after_pose
+            )
+            predicted = lietorch.Sim3(torch.as_tensor(
+                data, dtype=frame.T_WC.data.dtype, device=frame.T_WC.data.device
+            ).reshape(1, 8))
+            # The incoming frame is initialized with the independent gyro prior.
+            if (self.cfg.get("imu_rotation_prior", False)
+                    and float(rotation_disagreement_deg(predicted, frame.T_WC).item()) > 1.5):
+                return None
+            return predicted
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def log_takeover(self, frame, reason, accepted):
+        self.last_takeover_report = dict(
+            frame_id=frame.frame_id, reason=reason, accepted=accepted,
+            pose_only=bool(getattr(frame, "pose_only", False)),
+            recovery_count=self.vins_recovery_count,
+            degraded_frames=self.vins_degraded_frames,
+            external_ground_truth_used=False,
+        )
+        path = os.environ.get("MAST3R_VINS_TAKEOVER_LOG")
+        if path:
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(self.last_takeover_report, sort_keys=True) + "\n")
+
+    def recover_vins(self, frame, reason, *, recovery_pending=False):
+        if not self.cfg.get("vins_visual_takeover", False):
+            return False
+        predicted = self.predict_vins_pose(frame)
+        if predicted is None:
+            self.log_takeover(frame, "vins_unavailable:" + reason, False)
+            return False
+        frame.T_WC = predicted
+        frame.pose_only = True
+        self.vins_degraded = True
+        self.vins_degraded_frames += 1
+        if not recovery_pending:
+            self.vins_recovery_count = 0
+            self.vins_recovery_frame_id = None
+        self.reset_idx_f2k()
+        self.log_takeover(frame, reason, True)
+        return True
+
+    def recover_visual_solve_failure(self, frame, error):
+        if not isinstance(error, (VisualSolveRejected, torch.linalg.LinAlgError)):
+            raise error
+        return self.recover_vins(frame, "visual_solve_failed:" + str(error))
+
+    def accept_visual_recovery(self, visual_pose, frame):
+        predicted = self.predict_vins_pose(frame)
+        if predicted is None:
+            self.vins_recovery_count = 0
+            self.vins_recovery_frame_id = None
+            # VINS initializes later than the first image. Do not prohibit a
+            # healthy visual start merely because its prior is not ready yet.
+            rows = self.vins_camera_poses
+            previous = self.previous_frame
+            if (
+                not self.vins_degraded and rows is not None and previous is not None
+                and 0 <= previous.frame_id < frame.frame_id < len(rows)
+                and (rows[previous.frame_id]["valid"] != "1"
+                     or rows[frame.frame_id]["valid"] != "1")
+            ):
+                return bool(torch.isfinite(visual_pose.data).all())
+            return False
+        translation_error = float(torch.linalg.vector_norm(
+            visual_pose.data[0, :3] - predicted.data[0, :3]
+        ).item())
+        scale_change = abs(float(visual_pose.data[0, 7] / predicted.data[0, 7]) - 1.0)
+        consistent = (
+            bool(torch.isfinite(visual_pose.data).all())
+            and translation_error <= 3 * float(self.cfg["vins_translation_prior_sigma_m"])
+            and float(rotation_disagreement_deg(visual_pose, predicted).item()) <= 1.5
+            and scale_change <= float(self.cfg.get("stereo_scale_max_relative_jump", 0.25))
+        )
+        if not consistent:
+            self.vins_recovery_count = 0
+            self.vins_recovery_frame_id = None
+            return False
+        if self.vins_degraded:
+            if self.vins_recovery_frame_id == frame.frame_id:
+                return False
+            if self.vins_recovery_frame_id != frame.frame_id - 1:
+                self.vins_recovery_count = 0
+            self.vins_recovery_frame_id = frame.frame_id
+            self.vins_recovery_count += 1
+            if self.vins_recovery_count < 2:
+                return False
+        self.vins_degraded = False
+        self.vins_recovery_count = 0
+        self.vins_recovery_frame_id = None
+        self.vins_degraded_frames = 0
+        return True
 
     def configure_stereo_imu_anchor(self, increments, depth_getter):
         if depth_getter is None:
@@ -481,6 +608,8 @@ class FrameTracker:
             else self.keyframes[reference_keyframe_index]
         )
         rotation_prior_pose = frame.T_WC
+        takeover = bool(self.cfg.get("vins_visual_takeover", False))
+        previous_metric_scale = self.metric_pointmap_scale
 
         imu_relative = None
         if self.spatial_recovery_rotations is not None:
@@ -517,6 +646,15 @@ class FrameTracker:
 
         # Update keyframe pointmap after registration (need pose)
         frame.update_pointmap(Xff, Cff)
+
+        if takeover:
+            minimum = int(self.cfg.get("stereo_scale_min_points", 500))
+            confidence = float(self.cfg.get("stereo_scale_min_confidence", 1.5))
+            reference_support = int((Ckf >= confidence).sum().item())
+            if not stereo_scale_report.get("accepted") or reference_support < minimum:
+                self.metric_pointmap_scale = previous_metric_scale
+                accepted = self.recover_vins(frame, "unreliable_pointmap_geometry")
+                return False, [], not accepted
 
         use_calib = config["use_calib"]
         img_size = frame.img.shape[-2:]
@@ -570,6 +708,10 @@ class FrameTracker:
         log_match_stats(frame.frame_id, valid_match_k, valid_kf, valid_opt)
         if match_frac < self.cfg["min_match_frac"]:
             print(f"Skipped frame {frame.frame_id}")
+            if takeover:
+                self.metric_pointmap_scale = previous_metric_scale
+                accepted = self.recover_vins(frame, "insufficient_visual_matches")
+                return False, [], not accepted
             return False, [], True
 
         metric_pose = None
@@ -726,6 +868,10 @@ class FrameTracker:
                     float(T_WCk.data[0, 7].item()),
                 )
         except Exception as e:
+            if takeover:
+                self.metric_pointmap_scale = previous_metric_scale
+                accepted = self.recover_visual_solve_failure(frame, e)
+                return False, [], not accepted
             print(f"Cholesky failed {frame.frame_id}")
             return False, [], True
 
@@ -793,6 +939,17 @@ class FrameTracker:
             if corrected is not None:
                 T_CkCf = corrected
                 T_WCf = T_WCk * T_CkCf
+
+        if takeover:
+            if not self.accept_visual_recovery(T_WCf, frame):
+                self.metric_pointmap_scale = previous_metric_scale
+                accepted = self.recover_vins(
+                    frame, "visual_vins_consistency_or_recovery_pending",
+                    recovery_pending=self.vins_recovery_count > 0,
+                )
+                return False, [], not accepted
+            frame.pose_only = False
+            self.log_takeover(frame, "visual_accepted", True)
 
         frame.T_WC = T_WCf
         if self.vins_camera_poses is not None and self.vins_visual_anchor is None:
@@ -1072,6 +1229,18 @@ class FrameTracker:
                 visual_row_count=visual_row_count,
                 visual_effective_count=visual_effective_count,
             )
+            if self.cfg.get("vins_visual_takeover", False) and metric_translation_target is not None:
+                if not math.isfinite(new_cost) or not bool(torch.isfinite(tau_ij_sim3).all()):
+                    raise VisualSolveRejected("nonfinite_visual_solve")
+                if new_cost > old_cost * (1.0 + 1e-6):
+                    raise VisualSolveRejected("uphill_visual_solve")
+                # Return only a state whose cost has actually been evaluated.
+                # The legacy loop applied an unevaluated terminal increment.
+                if check_convergence(
+                    step, self.cfg["rel_error"], self.cfg["delta_norm"],
+                    old_cost, new_cost, tau_ij_sim3,
+                ):
+                    break
             T_CkCf = T_CkCf.retr(tau_ij_sim3)
 
             if check_convergence(
@@ -1086,6 +1255,8 @@ class FrameTracker:
             old_cost = new_cost
 
             if step == self.cfg["max_iters"] - 1:
+                if self.cfg.get("vins_visual_takeover", False) and metric_translation_target is not None:
+                    raise VisualSolveRejected("visual_solve_max_iterations")
                 print(f"max iters reached {last_error}")
 
         # Assign new pose based on relative pose

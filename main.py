@@ -527,10 +527,12 @@ if __name__ == "__main__":
             frames.append(img)
 
         # get frames last camera pose
+        previous_frame = None if i == 0 else states.get_frame()
+        tracker.previous_frame = previous_frame
         T_WC = (
             lietorch.Sim3.Identity(1, device=device)
             if i == 0
-            else states.get_frame().T_WC
+            else previous_frame.T_WC
         )
         if use_imu_rotation_prior and i > 0:
             T_WC = apply_rotation_prior(T_WC, dataset.get_rotation_prior(i))
@@ -638,10 +640,16 @@ if __name__ == "__main__":
                 if use_stereo_pointmap_scale:
                     print("Stereo pointmap scale", frame.frame_id, stereo_scale_report)
                 frame.update_pointmap(X, C)
+                recovered_vins = tracker.recover_vins(frame, "visual_relocalization_unavailable")
                 states.set_frame(frame)
-                states.queue_reloc()
+                if recovered_vins:
+                    tracked = True
+                    states.set_mode(Mode.TRACKING)
+                    states.set_frame(frame)
+                else:
+                    states.queue_reloc()
                 # In single threaded mode, ensure relocalization runs for every frame.
-                while config["single_thread"]:
+                while config["single_thread"] and not recovered_vins:
                     raise_if_backend_exited(backend)
                     with states.lock:
                         if states.reloc_sem.value == 0:
@@ -673,7 +681,7 @@ if __name__ == "__main__":
                 (frame.frame_id, anchor_idx, relative_pose.data.detach().cpu())
             )
             online_poses.append((frame.frame_id, frame.T_WC.data.detach().cpu()))
-            if descriptor_recovery:
+            if descriptor_recovery and not getattr(frame, "pose_only", False):
                 descriptor_anchors.accept(frame)
         elif mode == Mode.RELOC and states.get_mode() == Mode.TRACKING:
             anchor_idx = len(keyframes) - 1
