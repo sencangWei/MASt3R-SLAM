@@ -33,6 +33,22 @@ robot, Lighthouse, or evaluation error is read by these decisions.
   is isolated from the old graph. After two consistent frames, visual pose
   estimation can resume against this recent reference. Neither rejected nor
   recovered local observations write the old graph or create graph edges.
+- Experimental graph re-entry is still default-off. When
+  `tracking.vins_visual_safe_reentry: true`, a shadow-recovered frame must
+  first pass a read-only graph-anchor probe, a multi-frame VINS consistency
+  window, and a mandatory bidirectional D405 stereo metric bridge before it can
+  become a graph keyframe again. The window uses the existing
+  `vins_translation_prior_sigma_m`, `vins_reentry_window_max_sigma` and a
+  hard `vins_reentry_window_max_error_m` cap (default 12 mm), so same-direction
+  adjacent errors cannot accumulate indefinitely. Rejected recovery frames keep
+  predicting from the last trusted window anchor until validated re-entry, rather
+  than re-anchoring on the rejected pose. The bridge uses temporary
+  depth-valid masks when the global pointmap-depth-anchor mode is disabled; it
+  does not enable that sealed parameter family or rewrite keyframe pointmaps.
+- Re-entry frames are marked `requires_metric_bridge` in SharedKeyframes. The
+  backend no longer grants the normal consecutive-edge exemption to those
+  frames, so a bridge edge must pass the ordinary match gate and, when enabled,
+  the metric loop gate too.
 - Before VINS initialization, retain the existing healthy visual start; there
   is no valid VINS motion to fabricate. Unexpected software errors propagate
   instead of being silently converted to a successful fallback.
@@ -59,16 +75,10 @@ keyframe too old: the full ind2 replay's last 554 frames remained pose-only. Hel
 streak is 83 frames, heldout4's is 203. This is an unresolved mechanism gap,
 not an accepted production result. New full replays and independent fused
 precision checks are required for the local-reference extension.
-`degraded_frames` is logged. Do not promote a coverage-only VINS stream as
-successful learned-visual recovery. The local recovery reference is NOT a
-probationary graph anchor; graph re-entry is intentionally not implemented.
-Once this reference is active, later poses do not add new loop/keyframe factors.
-A confirmed new graph anchor must NOT use the
-default stale consecutive graph edge: the current backend exempts consecutive
-edges from its match-fraction gate. Graph re-entry therefore needs a tested
-onboard bridge/edge-validation design, not simply appending a fresh frame and
-queuing normal optimization. The unchanged independent evaluator remains
-required before promotion.
+`degraded_frames`, `window_anchor_frame_id`, recovery decisions and re-entry
+reasons are logged. Do not promote a coverage-only VINS stream as successful
+learned-visual recovery. The unchanged independent evaluator remains required
+before promotion.
 
 Main integration configuration and reproducible diagnostic launcher live in
 `ego_vio_humble/config/mast3r_slam_d405_vins_visual_takeover.yaml` and

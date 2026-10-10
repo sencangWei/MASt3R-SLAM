@@ -19,7 +19,11 @@ from mast3r_slam.geometry import (
 )
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
-from mast3r_slam.mast3r_utils import mast3r_asymmetric_inference, mast3r_match_asymmetric
+from mast3r_slam.mast3r_utils import (
+    mast3r_asymmetric_inference,
+    mast3r_match_asymmetric,
+    mast3r_match_symmetric,
+)
 from mast3r_slam.stereo_depth import (
     embed_pose_increment,
     force_unit_sim3_scale,
@@ -44,6 +48,22 @@ _MATCH_LOG = os.environ.get("MAST3R_MATCH_LOG", "")
 
 class VisualSolveRejected(RuntimeError):
     """Expected numerical rejection, not an arbitrary visual-path defect."""
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        return value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+    return value
+
+
 _ROBUST_LOG = os.environ.get("MAST3R_ROBUST_LOG", "")
 _FRONTEND_LOG = os.environ.get("MAST3R_FRONTEND_LOG", "")
 _robust_samples = {}  # (width, part) -> list[Tensor]
@@ -226,6 +246,12 @@ class FrameTracker:
         self.last_takeover_report = None
         self.recovery_reference = None
         self.recovery_reference_scale = None
+        self.vins_window_visual_anchor = None
+        self.vins_window_pose_anchor = None
+        self.vins_window_frame_id = None
+        self.last_reentry_probe_report = None
+        self.last_visual_consistency_report = None
+        self.in_reentry_probe = False
         self.stereo_imu_anchor = None
         self.spatial_recovery_rotations = None
         self.vins_translation_prior_sigma_m = float(
@@ -247,6 +273,18 @@ class FrameTracker:
             raise ValueError("VINS visual takeover requires metric camera pose priors")
 
         self.reset_idx_f2k()
+
+    def reset_vins_recovery_window(self):
+        self.vins_window_visual_anchor = None
+        self.vins_window_pose_anchor = None
+        self.vins_window_frame_id = None
+
+    def _has_vins_recovery_window(self):
+        return (
+            self.vins_window_visual_anchor is not None
+            and self.vins_window_pose_anchor is not None
+            and self.vins_window_frame_id is not None
+        )
 
     def predict_vins_pose(self, frame):
         previous = self.previous_frame
@@ -277,25 +315,138 @@ class FrameTracker:
         except (ValueError, KeyError, TypeError):
             return None
 
-    def log_takeover(self, frame, reason, accepted):
-        self.last_takeover_report = dict(
-            frame_id=frame.frame_id, reason=reason, accepted=accepted,
-            pose_only=bool(getattr(frame, "pose_only", False)),
-            recovery_count=self.vins_recovery_count,
-            degraded_frames=self.vins_degraded_frames,
-            recovery_reference_id=(None if getattr(self, "recovery_reference", None) is None
-                                   else self.recovery_reference.frame_id),
-            external_ground_truth_used=False,
+    def _predict_vins_pose_from_window_anchor(self, frame):
+        rows = self.vins_camera_poses
+        if (
+            rows is None
+            or self.vins_window_visual_anchor is None
+            or self.vins_window_pose_anchor is None
+            or self.vins_window_frame_id is None
+            or not 0 <= self.vins_window_frame_id < frame.frame_id < len(rows)
+        ):
+            return None
+        current = rows[frame.frame_id]
+        if current["valid"] != "1":
+            return None
+        try:
+            current_pose = self.vins_pose_from_row(current)
+            data = propagate_vins_relative_pose(
+                self.vins_window_visual_anchor, self.vins_window_pose_anchor, current_pose
+            )
+            return lietorch.Sim3(torch.as_tensor(
+                data, dtype=frame.T_WC.data.dtype, device=frame.T_WC.data.device
+            ).reshape(1, 8))
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def visual_vins_consistency_report(self, visual_pose, frame):
+        predicted = self.predict_vins_pose(frame)
+        report = {
+            "accepted": False,
+            "reason": "vins_unavailable",
+            "frame_id": int(frame.frame_id),
+            "window_anchor_frame_id": self.vins_window_frame_id,
+        }
+        if predicted is None:
+            return False, report
+        translation_error = float(torch.linalg.vector_norm(
+            visual_pose.data[0, :3] - predicted.data[0, :3]
+        ).item())
+        scale_change = abs(float(visual_pose.data[0, 7] / predicted.data[0, 7]) - 1.0)
+        report.update(
+            adjacent_translation_error_m=translation_error,
+            adjacent_rotation_error_deg=float(
+                rotation_disagreement_deg(visual_pose, predicted).item()
+            ),
+            adjacent_scale_change=scale_change,
         )
+        adjacent_limit = 3 * float(self.cfg["vins_translation_prior_sigma_m"])
+        if not bool(torch.isfinite(visual_pose.data).all()):
+            report["reason"] = "nonfinite_visual_pose"
+            return False, report
+        if translation_error > adjacent_limit:
+            report["reason"] = "adjacent_vins_translation_disagreement"
+            return False, report
+        if report["adjacent_rotation_error_deg"] > 1.5:
+            report["reason"] = "adjacent_vins_rotation_disagreement"
+            return False, report
+        if scale_change > float(self.cfg.get("stereo_scale_max_relative_jump", 0.25)):
+            report["reason"] = "visual_scale_jump"
+            return False, report
+
+        window_predicted = (
+            self._predict_vins_pose_from_window_anchor(frame)
+            if self.cfg.get("vins_visual_safe_reentry", False) else None
+        )
+        if window_predicted is not None:
+            window_error = float(torch.linalg.vector_norm(
+                visual_pose.data[0, :3] - window_predicted.data[0, :3]
+            ).item())
+            steps = max(int(frame.frame_id - self.vins_window_frame_id), 1)
+            sigma = float(self.cfg["vins_translation_prior_sigma_m"])
+            max_sigma = float(self.cfg.get("vins_reentry_window_max_sigma", 3.0))
+            window_limit = sigma * max_sigma * math.sqrt(steps)
+            cap = float(self.cfg.get("vins_reentry_window_max_error_m", 0.012))
+            if cap > 0.0:
+                window_limit = min(window_limit, cap)
+            report.update(
+                window_translation_error_m=window_error,
+                window_translation_limit_m=window_limit,
+            )
+            if window_error > window_limit:
+                report["reason"] = "window_vins_translation_disagreement"
+                return False, report
+        report["accepted"] = True
+        report["reason"] = "visual_vins_consistent"
+        return True, report
+
+    def anchor_vins_recovery_window(self, visual_pose, frame):
+        rows = self.vins_camera_poses
+        if rows is None or not 0 <= frame.frame_id < len(rows):
+            return
+        row = rows[frame.frame_id]
+        if row["valid"] != "1":
+            return
+        self.vins_window_visual_anchor = (
+            visual_pose.data[0].detach().cpu().numpy().copy()
+        )
+        self.vins_window_pose_anchor = self.vins_pose_from_row(row)
+        self.vins_window_frame_id = frame.frame_id
+
+    def _emit_takeover_report(self, report):
+        report = dict(report, diagnostic_probe=bool(getattr(self, "in_reentry_probe", False)))
+        self.last_takeover_report = _json_ready(report)
         path = os.environ.get("MAST3R_VINS_TAKEOVER_LOG")
         if path:
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(self.last_takeover_report, sort_keys=True) + "\n")
 
+    def log_takeover(self, frame, reason, accepted, **details):
+        report = dict(
+            frame_id=frame.frame_id, reason=reason, accepted=accepted,
+            pose_only=bool(getattr(frame, "pose_only", False)),
+            recovery_count=self.vins_recovery_count,
+            degraded_frames=self.vins_degraded_frames,
+            recovery_reference_id=(None if getattr(self, "recovery_reference", None) is None
+                                   else getattr(self.recovery_reference, "frame_id", None)),
+            window_anchor_frame_id=self.vins_window_frame_id,
+            external_ground_truth_used=False,
+        )
+        report.update(details)
+        self._emit_takeover_report(report)
+
     def recover_vins(self, frame, reason, *, recovery_pending=False):
         if not self.cfg.get("vins_visual_takeover", False):
             return False
-        predicted = self.predict_vins_pose(frame)
+        predicted = (
+            self._predict_vins_pose_from_window_anchor(frame)
+            if (
+                self.cfg.get("vins_visual_safe_reentry", False)
+                and self._has_vins_recovery_window()
+            ) else None
+        )
+        if predicted is None:
+            predicted = self.predict_vins_pose(frame)
         if predicted is None:
             self.log_takeover(frame, "vins_unavailable:" + reason, False)
             return False
@@ -306,6 +457,11 @@ class FrameTracker:
         if not recovery_pending:
             self.vins_recovery_count = 0
             self.vins_recovery_frame_id = None
+            if not (
+                self.cfg.get("vins_visual_safe_reentry", False)
+                and self._has_vins_recovery_window()
+            ):
+                self.reset_vins_recovery_window()
         self.reset_idx_f2k()
         self.log_takeover(frame, reason, True)
         return True
@@ -358,33 +514,280 @@ class FrameTracker:
             ):
                 return bool(torch.isfinite(visual_pose.data).all())
             return False
-        translation_error = float(torch.linalg.vector_norm(
-            visual_pose.data[0, :3] - predicted.data[0, :3]
-        ).item())
-        scale_change = abs(float(visual_pose.data[0, 7] / predicted.data[0, 7]) - 1.0)
-        consistent = (
-            bool(torch.isfinite(visual_pose.data).all())
-            and translation_error <= 3 * float(self.cfg["vins_translation_prior_sigma_m"])
-            and float(rotation_disagreement_deg(visual_pose, predicted).item()) <= 1.5
-            and scale_change <= float(self.cfg.get("stereo_scale_max_relative_jump", 0.25))
-        )
+        consistent, report = self.visual_vins_consistency_report(visual_pose, frame)
+        self.last_visual_consistency_report = report
         if not consistent:
             self.vins_recovery_count = 0
             self.vins_recovery_frame_id = None
+            if not (
+                self.cfg.get("vins_visual_safe_reentry", False)
+                and self._has_vins_recovery_window()
+            ):
+                self.reset_vins_recovery_window()
+            self._emit_takeover_report(dict(report, external_ground_truth_used=False))
             return False
         if self.vins_degraded:
+            if (
+                self.cfg.get("vins_visual_safe_reentry", False)
+                and self.vins_window_visual_anchor is None
+            ):
+                self.anchor_vins_recovery_window(visual_pose, frame)
             if self.vins_recovery_frame_id == frame.frame_id:
                 return False
             if self.vins_recovery_frame_id != frame.frame_id - 1:
                 self.vins_recovery_count = 0
             self.vins_recovery_frame_id = frame.frame_id
             self.vins_recovery_count += 1
-            if self.vins_recovery_count < 2:
+            required = int(self.cfg.get("vins_reentry_min_confirmations", 2))
+            if self.vins_recovery_count < required:
                 return False
         self.vins_degraded = False
         self.vins_recovery_count = 0
         self.vins_recovery_frame_id = None
         self.vins_degraded_frames = 0
+        if self.recovery_reference is None:
+            self.reset_vins_recovery_window()
+        return True
+
+    def _copy_probe_frame(self, frame):
+        probe = copy.copy(frame)
+        probe.T_WC = lietorch.Sim3(frame.T_WC.data.clone())
+        for attr in ("X_canon", "C", "feat", "pos", "metric_anchor_mask"):
+            value = getattr(frame, attr, None)
+            if torch.is_tensor(value):
+                setattr(probe, attr, value.clone())
+        return probe
+
+    def _graph_keyframe_count(self):
+        try:
+            return len(self.keyframes)
+        except TypeError:
+            length = getattr(self.keyframes, "__len__", None)
+            if callable(length):
+                try:
+                    return int(length())
+                except TypeError:
+                    return int(length(self.keyframes))
+            return 0
+
+    def _snapshot_reentry_state(self):
+        return {
+            "idx_f2k": None if self.idx_f2k is None else self.idx_f2k.clone(),
+            "vins_degraded": self.vins_degraded,
+            "vins_recovery_count": self.vins_recovery_count,
+            "vins_recovery_frame_id": self.vins_recovery_frame_id,
+            "vins_degraded_frames": self.vins_degraded_frames,
+            "vins_window_visual_anchor": None if self.vins_window_visual_anchor is None
+            else self.vins_window_visual_anchor.copy(),
+            "vins_window_pose_anchor": None if self.vins_window_pose_anchor is None
+            else self.vins_window_pose_anchor.copy(),
+            "vins_window_frame_id": self.vins_window_frame_id,
+            "last_takeover_report": self.last_takeover_report,
+            "last_visual_consistency_report": self.last_visual_consistency_report,
+            "in_reentry_probe": self.in_reentry_probe,
+            "metric_pointmap_scale": self.metric_pointmap_scale,
+            "last_metric_anchor_mask": self.last_metric_anchor_mask,
+            "vins_visual_anchor": None if self.vins_visual_anchor is None
+            else self.vins_visual_anchor.copy(),
+            "vins_pose_anchor": None if self.vins_pose_anchor is None
+            else self.vins_pose_anchor.copy(),
+        }
+
+    def _restore_reentry_state(self, state):
+        for key, value in state.items():
+            setattr(self, key, value)
+
+    def _probe_graph_reentry(self, frame, diagnostic_depth):
+        graph_count = self._graph_keyframe_count()
+        self.last_reentry_probe_report = None
+        if graph_count <= 0:
+            self.last_reentry_probe_report = {"accepted": False, "reason": "no_graph_anchor"}
+            return None
+        graph_anchor = self.keyframes[graph_count - 1]
+        probe = self._copy_probe_frame(frame)
+        state = self._snapshot_reentry_state()
+        try:
+            self.reset_idx_f2k()
+            self.in_reentry_probe = True
+            _, _, try_reloc = self.track(
+                probe,
+                diagnostic_depth=diagnostic_depth,
+                reference_keyframe_index=graph_count - 1,
+                update_reference=False,
+                reentry_probe=True,
+            )
+            self.in_reentry_probe = False
+            if try_reloc or bool(getattr(probe, "pose_only", False)):
+                self.last_reentry_probe_report = {
+                    "accepted": False,
+                    "reason": "graph_probe_tracking_failed",
+                    "try_reloc": bool(try_reloc),
+                    "pose_only": bool(getattr(probe, "pose_only", False)),
+                }
+                return None
+            accepted, report = self.metric_bridge_gate(graph_anchor, probe)
+            probe.metric_bridge_report = report
+            if not accepted:
+                self.last_reentry_probe_report = report
+                return None
+            return probe
+        finally:
+            self._restore_reentry_state(state)
+
+    def metric_bridge_gate(self, graph_anchor, frame):
+        report = {
+            "accepted": False,
+            "reason": "not_evaluated",
+            "first_frame_id": int(graph_anchor.frame_id),
+            "second_frame_id": int(frame.frame_id),
+            "geometry_source": "mandatory_bidirectional_d405_stereo_depth",
+        }
+        if not config["use_calib"]:
+            report["reason"] = "calibration_required"
+            return False, report
+        if (
+            getattr(graph_anchor, "metric_depth", None) is None
+            or getattr(frame, "metric_depth", None) is None
+            or not torch.isfinite(torch.as_tensor(graph_anchor.metric_depth)).any()
+            or not torch.isfinite(torch.as_tensor(frame.metric_depth)).any()
+        ):
+            report["reason"] = "stereo_depth_required"
+            return False, report
+        (
+            idx_i2j,
+            idx_j2i,
+            valid_match_j,
+            valid_match_i,
+            Qii,
+            Qjj,
+            Qji,
+            Qij,
+        ) = mast3r_match_symmetric(
+            self.model,
+            graph_anchor.feat,
+            graph_anchor.pos,
+            frame.feat,
+            frame.pos,
+            [graph_anchor.img_true_shape],
+            [frame.img_true_shape],
+        )
+        batch_inds = torch.arange(idx_i2j.shape[0], device=idx_i2j.device)[:, None].repeat(
+            1, idx_i2j.shape[1]
+        )
+        Qj = torch.sqrt(Qii[batch_inds, idx_i2j] * Qji)
+        Qi = torch.sqrt(Qjj[batch_inds, idx_j2i] * Qij)
+        valid_j = valid_match_j & (Qj > self.cfg["Q_conf"])
+        valid_i = valid_match_i & (Qi > self.cfg["Q_conf"])
+        match_frac_j = valid_j.float().mean()
+        match_frac_i = valid_i.float().mean()
+        min_match_frac = float(
+            self.cfg.get("vins_reentry_bridge_min_match_frac", self.cfg["min_match_frac"])
+        )
+        min_match_frac = max(
+            min_match_frac,
+            float(config.get("local_opt", {}).get("min_match_frac", min_match_frac)),
+        )
+        report.update(
+            match_frac_j=float(match_frac_j.item()),
+            match_frac_i=float(match_frac_i.item()),
+            min_match_frac=min_match_frac,
+        )
+        if min(float(match_frac_j.item()), float(match_frac_i.item())) < min_match_frac:
+            report["reason"] = "bridge_match_fraction_low"
+            return False, report
+
+        from mast3r_slam.global_opt import FactorGraph
+
+        graph_for_gate = copy.copy(graph_anchor)
+        frame_for_gate = copy.copy(frame)
+        for candidate in (graph_for_gate, frame_for_gate):
+            if getattr(candidate, "metric_anchor_mask", None) is None:
+                depth = torch.as_tensor(candidate.metric_depth, device=idx_i2j.device)
+                candidate.metric_anchor_mask = torch.isfinite(depth.reshape(-1)) & (
+                    depth.reshape(-1) > 0.0
+                )
+
+        gate = FactorGraph.__new__(FactorGraph)
+        gate.cfg = self.cfg
+        gate.K = graph_for_gate.K
+        gate.device = idx_i2j.device
+        if gate.K is None:
+            report["reason"] = "bridge_intrinsics_required"
+            return False, report
+        accepted, metric_report = gate.metric_loop_gate(
+            graph_for_gate,
+            frame_for_gate,
+            idx_i2j[0],
+            valid_j[0],
+            idx_j2i[0],
+            valid_i[0],
+        )
+        report["metric_loop"] = metric_report
+        if not accepted:
+            report["reason"] = "metric_bridge_rejected"
+            return False, report
+        report["accepted"] = True
+        report["reason"] = "metric_bridge_accepted"
+        return True, report
+
+    def try_safe_graph_reentry(self, frame, diagnostic_depth):
+        if not self.cfg.get("vins_visual_safe_reentry", False):
+            self.log_takeover(frame, "reentry_disabled", False)
+            return False
+        probe = self._probe_graph_reentry(frame, diagnostic_depth)
+        if probe is None:
+            report = self.last_reentry_probe_report or {
+                "accepted": False,
+                "reason": "reentry_probe_failed",
+            }
+            self._emit_takeover_report(dict(
+                frame_id=frame.frame_id,
+                reason="reentry_" + str(report.get("reason", "probe_failed")),
+                accepted=False,
+                reentry_probe=report,
+                external_ground_truth_used=False,
+            ))
+            return False
+        bridge_report = getattr(probe, "metric_bridge_report", {})
+        if not bridge_report.get("accepted", False):
+            self._emit_takeover_report(dict(
+                frame_id=frame.frame_id,
+                reason="reentry_metric_bridge_missing",
+                accepted=False,
+                metric_bridge=bridge_report,
+                external_ground_truth_used=False,
+            ))
+            return False
+        consistent, report = self.visual_vins_consistency_report(probe.T_WC, probe)
+        self.last_visual_consistency_report = report
+        if not consistent:
+            self._emit_takeover_report(dict(
+                report,
+                frame_id=frame.frame_id,
+                reason="reentry_" + report["reason"],
+                external_ground_truth_used=False,
+            ))
+            return False
+        for attr in ("T_WC", "X_canon", "C", "feat", "pos", "N", "N_updates",
+                     "metric_anchor_mask"):
+            if hasattr(probe, attr):
+                setattr(frame, attr, getattr(probe, attr))
+        frame.pose_only = False
+        frame.requires_metric_bridge = True
+        self.recovery_reference = None
+        self.recovery_reference_scale = None
+        self.vins_degraded = False
+        self.vins_degraded_frames = 0
+        self.vins_recovery_count = 0
+        self.vins_recovery_frame_id = None
+        self.reset_vins_recovery_window()
+        self.log_takeover(
+            frame,
+            "visual_reentry_accepted",
+            True,
+            metric_bridge=bridge_report,
+            consistency_report=report,
+        )
         return True
 
     def configure_stereo_imu_anchor(self, increments, depth_getter):
@@ -632,10 +1035,13 @@ class FrameTracker:
         diagnostic_depth=None,
         reference_keyframe_index=None,
         update_reference=True,
+        reentry_probe=False,
     ):
         takeover = bool(self.cfg.get("vins_visual_takeover", False))
         shadow = getattr(self, "recovery_reference", None) if takeover else None
-        using_shadow = shadow is not None and reference_keyframe_index is None
+        using_shadow = (
+            shadow is not None and reference_keyframe_index is None and not reentry_probe
+        )
         keyframe = shadow if using_shadow else (
             self.keyframes.last_keyframe()
             if reference_keyframe_index is None
@@ -997,10 +1403,15 @@ class FrameTracker:
                     self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
                 return False, [], not accepted
             frame.pose_only = False
-            self.log_takeover(frame, "visual_accepted", True)
+            details = {}
+            if self.cfg.get("vins_visual_safe_reentry", False):
+                details["consistency_report"] = self.last_visual_consistency_report
+            self.log_takeover(frame, "visual_accepted", True, **details)
 
         frame.T_WC = T_WCf
         if using_shadow:
+            if self.try_safe_graph_reentry(frame, diagnostic_depth):
+                return True, [], False
             self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
             # Recovery observations stay out of SharedKeyframes/retrieval and
             # cannot introduce an unchecked consecutive edge to the stale map.

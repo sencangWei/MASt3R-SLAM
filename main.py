@@ -428,6 +428,8 @@ if __name__ == "__main__":
             intrinsics["height"],
             intrinsics["calibration"],
         )
+    if config["tracking"].get("vins_visual_safe_reentry", False):
+        print("Effective use_calib after --calib override:", config["use_calib"])
 
     keyframes = SharedKeyframes(manager, h, w)
     states = SharedStates(manager, h, w)

@@ -32,6 +32,7 @@ class Frame:
     K: Optional[torch.Tensor] = None
     metric_depth: Optional[np.ndarray] = None
     metric_anchor_mask: Optional[torch.Tensor] = None
+    requires_metric_bridge: bool = False
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
@@ -273,6 +274,9 @@ class SharedKeyframes:
         self.metric_depth = torch.full(
             (buffer, h, w), float("nan"), device="cpu", dtype=dtype
         ).share_memory_()
+        self.requires_metric_bridge = torch.zeros(
+            buffer, device=device, dtype=torch.bool
+        ).share_memory_()
         # fmt: on
 
     def __getitem__(self, idx) -> Frame:
@@ -294,6 +298,7 @@ class SharedKeyframes:
             kf.N_updates = int(self.N_updates[idx])
             kf.metric_anchor_mask = self.metric_anchor_mask[idx]
             kf.metric_depth = self.metric_depth[idx]
+            kf.requires_metric_bridge = bool(self.requires_metric_bridge[idx].item())
             if config["use_calib"]:
                 kf.K = self.K
             return kf
@@ -325,6 +330,9 @@ class SharedKeyframes:
                 self.metric_depth[idx] = torch.as_tensor(
                     value.metric_depth, device="cpu", dtype=self.dtype
                 )
+            self.requires_metric_bridge[idx] = bool(
+                getattr(value, "requires_metric_bridge", False)
+            )
             self.is_dirty[idx] = True
             return idx
 

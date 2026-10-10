@@ -98,9 +98,32 @@ class FactorGraph:
         if self.K is None:
             report["reason"] = "camera_intrinsics_unavailable"
             return None, report
+        source_mask = source_frame.metric_anchor_mask
+        target_mask = target_frame.metric_anchor_mask
+        bridge_edge = bool(
+            getattr(source_frame, "requires_metric_bridge", False)
+            or getattr(target_frame, "requires_metric_bridge", False)
+        )
+        if bridge_edge:
+            if (
+                (source_mask is None or not bool(torch.as_tensor(source_mask).any()))
+                and source_frame.metric_depth is not None
+            ):
+                source_depth = torch.as_tensor(source_frame.metric_depth, device=self.device)
+                source_mask = torch.isfinite(source_depth.reshape(-1)) & (
+                    source_depth.reshape(-1) > 0.0
+                )
+            if (
+                (target_mask is None or not bool(torch.as_tensor(target_mask).any()))
+                and target_frame.metric_depth is not None
+            ):
+                target_depth = torch.as_tensor(target_frame.metric_depth, device=self.device)
+                target_mask = torch.isfinite(target_depth.reshape(-1)) & (
+                    target_depth.reshape(-1) > 0.0
+                )
         if (
-            source_frame.metric_anchor_mask is None
-            or target_frame.metric_anchor_mask is None
+            source_mask is None
+            or target_mask is None
             or source_frame.metric_depth is None
         ):
             report["reason"] = "metric_depth_unavailable"
@@ -111,12 +134,12 @@ class FactorGraph:
         source_indices = target_to_source_index.reshape(-1).long()
         valid = valid_target.reshape(-1).bool()
         valid &= source_indices >= 0
-        valid &= source_indices < source_frame.metric_anchor_mask.numel()
-        valid &= target_frame.metric_anchor_mask[:pixel_count]
+        valid &= source_indices < source_mask.numel()
+        valid &= target_mask[:pixel_count]
         safe_source_indices = source_indices.clamp(
-            min=0, max=source_frame.metric_anchor_mask.numel() - 1
+            min=0, max=source_mask.numel() - 1
         )
-        valid &= source_frame.metric_anchor_mask[safe_source_indices]
+        valid &= source_mask[safe_source_indices]
         candidates = current_indices[valid]
         maximum_points = int(cfg.get("metric_loop_pnp_max_points", 5000))
         if candidates.numel() > maximum_points:
@@ -294,7 +317,13 @@ class FactorGraph:
         # NOTE: Saying we need both edge directions to be above thrhreshold to accept either
         invalid_edges = torch.minimum(match_frac_j, match_frac_i) < min_match_frac
         consecutive_edges = ii_tensor == (jj_tensor - 1)
-        invalid_edges = (~consecutive_edges) & invalid_edges
+        bridge_edges = torch.as_tensor(
+            [bool(getattr(frame, "requires_metric_bridge", False)) for frame in kf_jj],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        unchecked_consecutive_edges = consecutive_edges & ~bridge_edges
+        invalid_edges = (~unchecked_consecutive_edges) & invalid_edges
 
         if is_reloc and os.environ.get("MAST3R_RELOC_ASYMMETRIC_LOCAL") == "1":
             for edge_index, (current, candidate) in enumerate(zip(kf_ii, kf_jj)):
@@ -309,7 +338,10 @@ class FactorGraph:
 
         if bool(self.cfg.get("metric_loop_gate", False)):
             for edge_index, consecutive in enumerate(consecutive_edges.tolist()):
-                if consecutive or bool(invalid_edges[edge_index].item()):
+                if (
+                    (consecutive and not bool(bridge_edges[edge_index].item()))
+                    or bool(invalid_edges[edge_index].item())
+                ):
                     continue
                 accepted, report = self.metric_loop_gate(
                     kf_ii[edge_index],
