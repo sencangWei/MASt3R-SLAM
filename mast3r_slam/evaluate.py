@@ -1,3 +1,5 @@
+import csv
+from contextlib import ExitStack
 import pathlib
 from typing import Optional
 import cv2
@@ -44,7 +46,7 @@ def save_traj(
             f.write(f"{t} {x} {y} {z} {qx} {qy} {qz} {qw}\n")
 
 
-def save_full_traj(logdir, logfile, timestamps, frames, tracked_poses):
+def save_full_traj(logdir, logfile, timestamps, frames, tracked_poses, *, online_poses=None):
     """Save tracked camera poses after re-anchoring them to optimized keyframes.
 
     Each record stores the frame pose relative to the keyframe that tracked it.
@@ -53,15 +55,41 @@ def save_full_traj(logdir, logfile, timestamps, frames, tracked_poses):
     """
     logfile = pathlib.Path(logdir) / logfile
     logfile.parent.mkdir(exist_ok=True, parents=True)
-    with logfile.open("w") as stream:
-        for frame_id, anchor_idx, relative_pose_data in tracked_poses:
-            anchor = frames[anchor_idx].T_WC
+    if online_poses is not None:
+        tracked_ids = [frame_id for frame_id, _, _ in tracked_poses]
+        if (tracked_ids != [frame_id for frame_id, _ in online_poses]
+                or len(set(tracked_ids)) != len(tracked_ids)):
+            raise ValueError("diagnostic online/tracked frame IDs do not bind")
+    with ExitStack() as stack:
+        writer = None
+        if online_poses is not None:
+            statefile = logfile.with_name(f"{logfile.stem}_sim3_states.csv")
+            state_stream = stack.enter_context(statefile.open("x", newline=""))
+            writer = csv.writer(state_stream)
+            components = ("tx", "ty", "tz", "qx", "qy", "qz", "qw", "s")
+            writer.writerow(["frame_id", "t_sec", "anchor_idx", "anchor_frame_id"] +
+                            [f"{prefix}_{name}" for prefix in
+                             ("relative", "online", "final_anchor", "final")
+                             for name in components])
+        stream = stack.enter_context(logfile.open("w"))
+        for index, (frame_id, anchor_idx, relative_pose_data) in enumerate(tracked_poses):
+            keyframe = frames[anchor_idx]
+            anchor = keyframe.T_WC
+            if writer is not None:
+                anchor = type(anchor)(anchor.data.detach().clone())
             relative = type(anchor)(relative_pose_data.to(anchor.data.device))
-            T_WC = as_SE3(anchor * relative)
+            final_pose = anchor * relative
+            T_WC = as_SE3(final_pose)
             x, y, z, qx, qy, qz, qw = T_WC.data.numpy().reshape(-1)
             stream.write(
                 f"{timestamps[frame_id]} {x} {y} {z} {qx} {qy} {qz} {qw}\n"
             )
+            if writer is not None:
+                values = [data.detach().cpu().reshape(-1).tolist() for data in
+                          (relative_pose_data, online_poses[index][1],
+                           anchor.data, final_pose.data)]
+                writer.writerow([frame_id, timestamps[frame_id], anchor_idx,
+                                 keyframe.frame_id] + [value for row in values for value in row])
 
 
 def save_online_traj(logdir, logfile, timestamps, frames, online_poses):

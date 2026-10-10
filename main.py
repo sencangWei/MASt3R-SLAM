@@ -700,6 +700,8 @@ if __name__ == "__main__":
             dataset.timestamps,
             keyframes,
             tracked_poses,
+            online_poses=(online_poses if os.environ.get("UMI_EXPORT_SLAM_FRAME_STATES") == "1"
+                          else None),
         )
         eval.save_online_traj(
             save_dir,
