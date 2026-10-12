@@ -30,8 +30,13 @@ def descriptor_relative_translation(metric_translation, *, pointmap_scale,
 
 def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
                            source_pointmap_z, source_confidence, camera_matrix,
-                           minimum_confidence=1.5):
-    """Return source-to-target metric SE(3), model-to-meter scale, and gates."""
+                           minimum_confidence=1.5, *, target_subpixel_xy=None):
+    """Return source-to-target metric SE(3), model-to-meter scale, and gates.
+
+    Optional subpixel observations affect PnP/reprojection only. Target depth
+    is sampled at their nearest physical grid cell, never interpolated. The
+    default integer path and all metric admission thresholds are unchanged.
+    """
     source_xy = np.asarray(source_xy, dtype=np.int32).reshape(-1, 2)
     target_xy = np.asarray(target_xy, dtype=np.int32).reshape(-1, 2)
     source_depth = np.asarray(source_depth)
@@ -44,6 +49,19 @@ def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
     if source_depth.shape != source_pointmap_z.shape or source_depth.shape != source_confidence.shape:
         raise ValueError("pointmap and metric depth grids must agree")
     height, width = source_depth.shape
+    target_uv = target_xy
+    if target_subpixel_xy is not None:
+        target_uv = np.asarray(target_subpixel_xy, dtype=np.float64)
+        if target_uv.shape != target_xy.shape or not np.isfinite(target_uv).all():
+            raise ValueError("subpixel observations must match descriptors and be finite")
+        if ((target_uv < 0).any() or (target_uv[:, 0] >= width).any()
+                or (target_uv[:, 1] >= height).any()):
+            raise ValueError("subpixel observations must be inside the depth grid")
+        target_cells = np.rint(target_uv).astype(np.int32)
+        if ((target_cells[:, 0] >= width).any() or (target_cells[:, 1] >= height).any()):
+            raise ValueError("nearest subpixel depth cells must be inside the grid")
+    else:
+        target_cells = target_xy
     inside = (
         (source_xy[:, 0] >= 0) & (source_xy[:, 0] < width)
         & (source_xy[:, 1] >= 0) & (source_xy[:, 1] < height)
@@ -51,10 +69,12 @@ def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
         & (target_xy[:, 1] >= 0) & (target_xy[:, 1] < height)
     )
     source_xy, target_xy = source_xy[inside], target_xy[inside]
+    target_uv, target_cells = target_uv[inside], target_cells[inside]
     z = source_depth[source_xy[:, 1], source_xy[:, 0]]
     good = np.isfinite(z) & (z >= 0.15) & (z <= 0.65)
     good &= source_confidence[source_xy[:, 1], source_xy[:, 0]] >= minimum_confidence
     source_xy, target_xy, z = source_xy[good], target_xy[good], z[good]
+    target_uv, target_cells = target_uv[good], target_cells[good]
     report = {"descriptor_matches": int(len(inside)), "metric_matches": int(len(z))}
     if len(z) < 100:
         return None, None, dict(report, accepted=False, reason="too_few_stereo_matches")
@@ -65,7 +85,7 @@ def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
         z,
     ))
     pose, pnp = solve_metric_keyframe_pnp(
-        xyz, target_xy, K, minimum_points=100,
+        xyz, target_uv, K, minimum_points=100,
         minimum_inlier_ratio=0.65, reprojection_error_px=2.0,
     )
     report.update(pnp)
@@ -76,8 +96,8 @@ def metric_descriptor_pose(source_xy, target_xy, source_depth, target_depth,
         K[0, 0] * projected[:, 0] / projected[:, 2] + K[0, 2],
         K[1, 1] * projected[:, 1] / projected[:, 2] + K[1, 2],
     ))
-    target_z = target_depth[target_xy[:, 1], target_xy[:, 0]]
-    reprojection = np.linalg.norm(uv - target_xy, axis=1)
+    target_z = target_depth[target_cells[:, 1], target_cells[:, 0]]
+    reprojection = np.linalg.norm(uv - target_uv, axis=1)
     depth_valid = (np.isfinite(target_z) & (target_z >= 0.15)
                    & (target_z <= 0.65) & (reprojection <= 2.0)
                    & (projected[:, 2] > 0))
