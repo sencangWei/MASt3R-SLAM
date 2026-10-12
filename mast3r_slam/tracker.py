@@ -626,6 +626,8 @@ class FrameTracker:
             "in_reentry_probe": self.in_reentry_probe,
             "metric_pointmap_scale": self.metric_pointmap_scale,
             "last_metric_anchor_mask": self.last_metric_anchor_mask,
+            "recovery_reference": self.recovery_reference,
+            "recovery_reference_scale": self.recovery_reference_scale,
             "vins_visual_anchor": None if self.vins_visual_anchor is None
             else self.vins_visual_anchor.copy(),
             "vins_pose_anchor": None if self.vins_pose_anchor is None

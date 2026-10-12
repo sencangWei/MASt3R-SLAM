@@ -843,6 +843,41 @@ def test_failed_probe_restores_vins_anchors_and_preserves_bridge_reason(monkeypa
     assert tracker.last_reentry_probe_report["reason"] == "metric_bridge_rejected_detail"
 
 
+@pytest.mark.parametrize("outcome", ["pose_only", "bridge_rejected", "exception", "accepted"])
+@pytest.mark.parametrize("existing_shadow", [False, True])
+def test_reentry_probe_restores_shadow_reference_on_every_exit(monkeypatch, outcome, existing_shadow):
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.keyframes = [SimpleNamespace(frame_id=0)]
+    original = object() if existing_shadow else None
+    original_scale = .4 if existing_shadow else None
+    tracker.recovery_reference = original
+    tracker.recovery_reference_scale = original_scale
+
+    def nested_track(probe, **kwargs):
+        assert kwargs["reentry_probe"] is True
+        tracker.recovery_reference = probe
+        tracker.recovery_reference_scale = .9
+        if outcome == "exception":
+            raise RuntimeError("nested tracking failed")
+        probe.pose_only = outcome == "pose_only"
+        return False, [], False
+
+    monkeypatch.setattr(tracker, "track", nested_track)
+    monkeypatch.setattr(
+        tracker, "metric_bridge_gate",
+        lambda anchor, probe: (outcome == "accepted", {"accepted": outcome == "accepted"}),
+    )
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="nested tracking failed"):
+            tracker._probe_graph_reentry(frame, None)
+    else:
+        result = tracker._probe_graph_reentry(frame, None)
+        assert (result is not None) == (outcome == "accepted")
+    assert tracker.recovery_reference is original
+    assert tracker.recovery_reference_scale == original_scale
+
+
 def _read_jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
