@@ -435,7 +435,7 @@ class FrameTracker:
         report.update(details)
         self._emit_takeover_report(report)
 
-    def recover_vins(self, frame, reason, *, recovery_pending=False):
+    def recover_vins(self, frame, reason, *, recovery_pending=False, **details):
         if not self.cfg.get("vins_visual_takeover", False):
             return False
         predicted = (
@@ -448,7 +448,7 @@ class FrameTracker:
         if predicted is None:
             predicted = self.predict_vins_pose(frame)
         if predicted is None:
-            self.log_takeover(frame, "vins_unavailable:" + reason, False)
+            self.log_takeover(frame, "vins_unavailable:" + reason, False, **details)
             return False
         frame.T_WC = predicted
         frame.pose_only = True
@@ -463,13 +463,52 @@ class FrameTracker:
             ):
                 self.reset_vins_recovery_window()
         self.reset_idx_f2k()
-        self.log_takeover(frame, reason, True)
+        self.log_takeover(frame, reason, True, **details)
         return True
 
     def recover_visual_solve_failure(self, frame, error):
         if not isinstance(error, (VisualSolveRejected, torch.linalg.LinAlgError)):
             raise error
         return self.recover_vins(frame, "visual_solve_failed:" + str(error))
+
+    def is_vins_startup(self, frame):
+        """Only the initial unobserved prefix may use output-only visual poses."""
+        rows = self.vins_camera_poses
+        previous = self.previous_frame
+        scale = self.metric_pointmap_scale
+        return bool(
+            self.cfg.get("vins_visual_takeover", False)
+            and not self.vins_degraded
+            and not self._has_vins_recovery_window()
+            and not getattr(self, "in_reentry_probe", False)
+            and previous is not None
+            and previous.frame_id == frame.frame_id - 1
+            and rows is not None and 0 < frame.frame_id < len(rows)
+            # The first valid row has no previous VINS measurement to form
+            # relative motion. Include that boundary frame, never a later gap.
+            and not any(row["valid"] == "1" for row in rows[:frame.frame_id])
+            and scale is not None and np.isfinite(scale) and scale > 0
+        )
+
+    def accept_startup_visual_pose(self, frame, visual_pose, rotation_error_deg, details):
+        """Publish a measured pose, never a trusted pointmap or graph factor."""
+        finite = bool(torch.isfinite(visual_pose.data).all())
+        step = float(torch.linalg.vector_norm(
+            visual_pose.data[..., :3] - self.previous_frame.T_WC.data[..., :3]
+        ).item())
+        if (not finite or not np.isfinite(rotation_error_deg)
+                or rotation_error_deg > 1.5 or step > 0.03):
+            self.log_takeover(frame, "startup_visual_motion_rejected", False,
+                              step_translation_m=step,
+                              imu_rotation_disagreement_deg=rotation_error_deg, **details)
+            return False
+        frame.T_WC = visual_pose
+        frame.pose_only = True
+        self.reset_idx_f2k()
+        self.log_takeover(frame, "startup_visual_unverified", True,
+                          step_translation_m=step,
+                          imu_rotation_disagreement_deg=rotation_error_deg, **details)
+        return True
 
     def seed_recovery_reference(self, frame, raw_points, confidence, K):
         """Keep a physically scaled local reference outside the global graph.
@@ -1042,6 +1081,7 @@ class FrameTracker:
         reentry_probe=False,
     ):
         takeover = bool(self.cfg.get("vins_visual_takeover", False))
+        startup_geometry_rejection = None
         shadow = getattr(self, "recovery_reference", None) if takeover else None
         using_shadow = (
             shadow is not None and reference_keyframe_index is None and not reentry_probe
@@ -1103,10 +1143,23 @@ class FrameTracker:
             reference_support = int((Ckf >= confidence).sum().item())
             if not stereo_scale_report.get("accepted") or reference_support < minimum:
                 self.metric_pointmap_scale = previous_metric_scale
-                accepted = self.recover_vins(frame, "unreliable_pointmap_geometry")
+                details = dict(
+                    geometry_report=stereo_scale_report,
+                    reference_support=reference_support,
+                    required_support=minimum,
+                    reference_frame_id=getattr(keyframe, "frame_id", None),
+                    using_recovery_reference=using_shadow,
+                )
+                accepted = self.recover_vins(frame, "unreliable_pointmap_geometry", **details)
                 if accepted:
                     self.seed_recovery_reference(frame, raw_current_points, Cff, keyframe.K)
-                return False, [], not accepted
+                    return False, [], False
+                if self.is_vins_startup(frame) and self.cfg.get("imu_rotation_prior", False):
+                    # Keep all original match/solver gates. The metric gate
+                    # still forbids map writes and independent learned factors.
+                    startup_geometry_rejection = details
+                else:
+                    return False, [], True
 
         use_calib = config["use_calib"]
         img_size = frame.img.shape[-2:]
@@ -1397,6 +1450,12 @@ class FrameTracker:
                 T_WCf = T_WCk * T_CkCf
 
         if takeover:
+            if startup_geometry_rejection is not None:
+                self.metric_pointmap_scale = previous_metric_scale
+                accepted = self.accept_startup_visual_pose(
+                    frame, T_WCf, disagreement_deg, startup_geometry_rejection
+                )
+                return False, [], not accepted
             if not self.accept_visual_recovery(T_WCf, frame):
                 self.metric_pointmap_scale = previous_metric_scale
                 accepted = self.recover_vins(

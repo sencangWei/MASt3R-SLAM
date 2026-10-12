@@ -316,6 +316,121 @@ def test_unreliable_geometry_returns_before_any_reference_update(monkeypatch, ge
     assert tracker.metric_pointmap_scale == 2.0
 
 
+def test_unavailable_vins_log_preserves_the_geometry_rejection_details():
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.vins_camera_poses[0]["valid"] = "0"
+    report = {"accepted": False, "reason": "insufficient_metric_depth_points", "candidate_points": 23}
+    assert not tracker.recover_vins(
+        frame, "unreliable_pointmap_geometry", geometry_report=report,
+        reference_support=170, required_support=500, reference_frame_id=0,
+    )
+    assert tracker.last_takeover_report["geometry_report"] == report
+    assert tracker.last_takeover_report["reference_support"] == 170
+    assert tracker.last_takeover_report["required_support"] == 500
+    assert tracker.last_takeover_report["reference_frame_id"] == 0
+    assert tracker.last_takeover_report["reason"] == "vins_unavailable:unreliable_pointmap_geometry"
+
+
+def test_startup_visual_export_keeps_graph_and_metric_state_unverified():
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.vins_camera_poses = [row(0, valid="0"), row(1, valid="0")]
+    tracker.metric_pointmap_scale = .4
+    tracker.keyframes = object()  # No graph access is allowed.
+    candidate = lietorch.Sim3(tracker.previous_frame.T_WC.data.clone())
+    candidate.data[0, 0] = .002
+    assert tracker.is_vins_startup(frame)
+    assert tracker.accept_startup_visual_pose(frame, candidate, .1, {"geometry_report": {"accepted": False}})
+    assert frame.pose_only
+    assert tracker.last_takeover_report["reason"] == "startup_visual_unverified"
+    assert tracker.last_takeover_report["geometry_report"]["accepted"] is False
+    assert tracker.metric_pointmap_scale == .4
+    assert not tracker.vins_degraded
+    assert tracker.recovery_reference is None
+
+
+@pytest.mark.parametrize("failure", ["ready", "past_gap", "degraded", "no_scale", "probe"])
+def test_startup_visual_path_cannot_bypass_live_recovery_gates(failure):
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.vins_camera_poses = [row(0, valid="0"), row(1, valid="0")]
+    tracker.metric_pointmap_scale = .4
+    if failure == "ready":
+        tracker.vins_camera_poses[0]["valid"] = "1"
+        tracker.vins_camera_poses[1]["valid"] = "1"
+    elif failure == "past_gap":
+        tracker.vins_camera_poses[0]["valid"] = "1"
+    elif failure == "degraded":
+        tracker.vins_degraded = True
+    elif failure == "no_scale":
+        tracker.metric_pointmap_scale = None
+    else:
+        tracker.in_reentry_probe = True
+    assert not tracker.is_vins_startup(frame)
+
+
+def test_first_valid_vins_row_still_needs_a_measured_visual_startup_pose():
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.vins_camera_poses[0]["valid"] = "0"
+    tracker.metric_pointmap_scale = .4
+    assert tracker.predict_vins_pose(frame) is None
+    assert tracker.is_vins_startup(frame)
+
+
+@pytest.mark.parametrize("translation,rotation", [(.04, .1), (.002, 2.), (float("nan"), .1)])
+def test_startup_visual_export_rejects_unmeasured_or_inconsistent_motion(translation, rotation):
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    candidate = lietorch.Sim3(tracker.previous_frame.T_WC.data.clone())
+    candidate.data[0, 0] = translation
+    original = frame.T_WC.data.clone()
+    assert not tracker.accept_startup_visual_pose(frame, candidate, rotation, {})
+    assert torch.equal(frame.T_WC.data, original)
+    assert not getattr(frame, "pose_only", False)
+
+
+def test_failed_metric_startup_runs_real_visual_solver_without_graph_writes(monkeypatch):
+    import mast3r_slam.tracker as module
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.cfg.update(C_conf=0., Q_conf=1.5, min_match_frac=.05,
+                       stereo_scale_min_points=2, imu_rotation_prior=True)
+    tracker.vins_camera_poses = [row(0, valid="0"), row(1, valid="0")]
+    tracker.metric_pointmap_scale = .4
+    tracker.spatial_recovery_rotations = None
+    tracker.stereo_imu_anchor = None
+    points = torch.tensor([[0., 0., .3], [.01, 0., .3], [0., .01, .3]])
+    confidence = torch.full((3, 1), 2.)
+    low_reference = torch.ones((3, 1))
+    keyframe = SimpleNamespace(K=None, frame_id=0, T_WC=tracker.previous_frame.T_WC)
+    tracker.keyframes = SimpleNamespace(last_keyframe=lambda: keyframe)
+    frame.metric_depth = np.full((1, 3), .3)
+    frame.img = torch.ones((3, 1, 3))
+    frame.update_pointmap = lambda *args: None
+    monkeypatch.setitem(module.config, "use_calib", False)
+    monkeypatch.setattr(module, "mast3r_match_asymmetric", lambda *args, **kwargs: (
+        torch.arange(3)[None], torch.ones((1, 3, 1), dtype=torch.bool),
+        points, confidence, confidence, points, low_reference, confidence,
+    ))
+    tracker.scale_pointmaps = lambda *args: ((points, points), {"accepted": True})
+    tracker.get_points_poses = lambda *args: (
+        points, points, frame.T_WC, keyframe.T_WC, confidence, confidence, None, None)
+    candidate = lietorch.Sim3(frame.T_WC.data.clone())
+    candidate.data[0, 0] = .002
+    calls = []
+    def solve(*args):
+        calls.append(True)
+        return candidate, lietorch.Sim3.Identity(1)
+    tracker.opt_pose_ray_dist_sim3 = solve
+    assert tracker.track(frame) == (False, [], False)
+    assert calls == [True]
+    assert frame.pose_only
+    assert tracker.last_takeover_report["reason"] == "startup_visual_unverified"
+    assert tracker.last_takeover_report["reference_support"] == 0
+
+
 @pytest.mark.parametrize("costs,delta_norm,expected", [
     ([1., 2.], 1e-8, "uphill_visual_solve"),
     ([1., .8], 1e-8, "visual_solve_max_iterations"),
