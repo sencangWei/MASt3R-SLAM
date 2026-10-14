@@ -239,6 +239,9 @@ class FrameTracker:
         self.vins_visual_anchor = None
         self.vins_pose_anchor = None
         self.previous_frame = None
+        self.startup_metric_source = None
+        self.last_startup_metric_frame_id = None
+        self.last_startup_metric_pose = None
         self.vins_degraded = False
         self.vins_recovery_count = 0
         self.vins_recovery_frame_id = None
@@ -490,11 +493,13 @@ class FrameTracker:
             and scale is not None and np.isfinite(scale) and scale > 0
         )
 
-    def accept_startup_visual_pose(self, frame, visual_pose, rotation_error_deg, details):
+    def accept_startup_visual_pose(self, frame, visual_pose, rotation_error_deg, details,
+                                  previous_pose=None):
         """Publish a measured pose, never a trusted pointmap or graph factor."""
         finite = bool(torch.isfinite(visual_pose.data).all())
+        previous_pose = self.previous_frame.T_WC if previous_pose is None else previous_pose
         step = float(torch.linalg.vector_norm(
-            visual_pose.data[..., :3] - self.previous_frame.T_WC.data[..., :3]
+            visual_pose.data[..., :3] - previous_pose.data[..., :3]
         ).item())
         if (not finite or not np.isfinite(rotation_error_deg)
                 or rotation_error_deg > 1.5 or step > 0.03):
@@ -509,6 +514,71 @@ class FrameTracker:
                           step_translation_m=step,
                           imu_rotation_disagreement_deg=rotation_error_deg, **details)
         return True
+
+    def recover_startup_metric_pose(self, frame):
+        """Measured stereo output for the initial VINS-empty prefix, not a map repair."""
+        source = getattr(self, "startup_metric_source", None)
+        previous = self.previous_frame
+        rows = self.vins_camera_poses
+        if (source is None or not self.cfg.get("vins_visual_takeover", False)
+                or self.vins_degraded or self._has_vins_recovery_window()
+                or getattr(self, "in_reentry_probe", False) or previous is None
+                or previous.frame_id != frame.frame_id - 1
+                or rows is None or not 0 < frame.frame_id < len(rows)
+                or any(row["valid"] == "1" for row in rows[:frame.frame_id])):
+            return False
+        # Pending RELOC still owns SharedStates. Keep a separate output anchor
+        # for consecutive measured startup gaps instead of rewriting its pose.
+        chained = getattr(self, "last_startup_metric_frame_id", None) == previous.frame_id
+        previous_pose = (self.last_startup_metric_pose if chained else previous.T_WC)
+        data = previous_pose.data[0].detach().cpu().numpy()
+        if not np.isfinite(data).all() or data[7] <= 0:
+            return False
+        # An unscaled learned pose cannot become a metric anchor by assertion.
+        # With no pointmap scale, use only the initial unit origin or a chain
+        # of our own physically measured startup outputs.
+        scale = self.metric_pointmap_scale
+        if scale is None:
+            trusted_prefix = (previous.frame_id == 0 or getattr(
+                self, "last_startup_metric_frame_id", None) == previous.frame_id)
+            if not trusted_prefix or not np.isclose(data[7], 1.):
+                return False
+        elif not np.isfinite(scale) or scale <= 0:
+            return False
+        observation = source(previous.frame_id, frame.frame_id)
+        if observation is None:
+            return False
+        from mast3r_slam.startup_metric_pose import solve_startup_metric_pose
+        transform, report = solve_startup_metric_pose(*observation, self.cfg)
+        if transform is None or report.get("accepted") is not True:
+            self.log_takeover(frame, "startup_metric_observation_rejected", False,
+                              pnp_report=report)
+            return False
+        transform = np.asarray(transform)
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            return False
+        rotation_error = float(report["imu_rotation_disagreement_deg"])
+        current_to_previous = np.linalg.inv(transform)
+        previous_rotation = Rotation.from_quat(data[3:7])
+        candidate_data = previous_pose.data.clone()
+        # PnP translation is already metres: as in VINS takeover, do not
+        # multiply it by the visual Sim3/pointmap scale.
+        candidate_data[0, :3] = torch.as_tensor(
+            data[:3] + previous_rotation.apply(current_to_previous[:3, 3]),
+            device=candidate_data.device, dtype=candidate_data.dtype)
+        candidate_data[0, 3:7] = torch.as_tensor(
+            (previous_rotation * Rotation.from_matrix(
+                current_to_previous[:3, :3])).as_quat(),
+            device=candidate_data.device, dtype=candidate_data.dtype)
+        accepted = self.accept_startup_visual_pose(
+            frame, lietorch.Sim3(candidate_data), rotation_error,
+            dict(recovery_method="stereo_lk_pnp_imu", pnp_report=report,
+                 metric_translation_source="recorded_stereo_baseline"),
+            previous_pose=previous_pose)
+        if accepted:
+            self.last_startup_metric_frame_id = frame.frame_id
+            self.last_startup_metric_pose = lietorch.Sim3(candidate_data.clone())
+        return accepted
 
     def seed_recovery_reference(self, frame, raw_points, confidence, K):
         """Keep a physically scaled local reference outside the global graph.

@@ -98,6 +98,27 @@ class MonocularDataset(torch.utils.data.Dataset):
             pathlib.Path(self.rgb_files[idx]), target_shape
         )
 
+    def get_startup_metric_observation(self, previous, current):
+        """Raw rectified stereo pixels and incremental IMU, in one camera gauge."""
+        intrinsics = self.camera_intrinsics
+        if (self.stereo_depth_provider is None or self.rotation_priors is None
+                or intrinsics is None or current != previous + 1
+                or not 0 <= previous < current < len(self.rgb_files)
+                or np.any(np.asarray(intrinsics.distortion) != 0)):
+            return None
+        images = [cv2.imread(str(self.rgb_files[index]), cv2.IMREAD_GRAYSCALE)
+                  for index in (previous, current)]
+        if any(image is None for image in images):
+            raise FileNotFoundError("startup stereo reference images missing")
+        if images[0].shape != (intrinsics.H, intrinsics.W) or images[1].shape != images[0].shape:
+            return None
+        depth = self.get_stereo_depth(previous, images[0].shape)
+        # Stored IMU priors are per-frame camera orientation increments,
+        # not absolute orientations. PnP maps source points to current camera.
+        imu_previous_to_current = Rotation.from_quat(
+            self.get_rotation_prior(current)).inv().as_matrix()
+        return (*images, depth, intrinsics.K_orig, imu_previous_to_current)
+
     def has_calib(self):
         return self.camera_intrinsics is not None
 

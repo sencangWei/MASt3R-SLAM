@@ -431,6 +431,103 @@ def test_failed_metric_startup_runs_real_visual_solver_without_graph_writes(monk
     assert tracker.last_takeover_report["reference_support"] == 0
 
 
+def startup_metric_fixture(monkeypatch):
+    import sys
+    tracker, frame = tracker_and_frames()
+    _with_window_state(tracker)
+    tracker.vins_camera_poses = [row(0, valid="0"), row(1, valid="0")]
+    tracker.previous_frame.T_WC.data[0, 7] = 1.
+    tracker.keyframes = object()  # This path must never inspect/write the graph.
+    observation = (np.zeros((32, 32), np.uint8), np.zeros((32, 32), np.uint8),
+                   np.ones((32, 32)), np.eye(3), np.eye(3))
+    tracker.startup_metric_source = lambda previous, current: observation
+    transform = np.eye(4)
+    transform[0, 3] = -.002  # source points -> current camera; camera moves +2mm.
+    report = dict(accepted=True, imu_rotation_disagreement_deg=.1,
+                  inlier_points=150, reprojection_p95_px=.4)
+    monkeypatch.setitem(sys.modules, "mast3r_slam.startup_metric_pose", SimpleNamespace(
+        solve_startup_metric_pose=lambda *args: (transform, report)))
+    return tracker, frame, transform, report
+
+
+def test_missing_first_metric_scale_has_measured_stereo_startup_output(monkeypatch):
+    tracker, frame, _, _ = startup_metric_fixture(monkeypatch)
+    assert tracker.metric_pointmap_scale is None
+    assert not tracker.is_vins_startup(frame)
+    assert tracker.recover_startup_metric_pose(frame)
+    assert torch.allclose(frame.T_WC.data[0, :3], torch.tensor([.002, 0, 0]))
+    assert frame.pose_only
+    assert tracker.last_takeover_report["reason"] == "startup_visual_unverified"
+    assert tracker.last_takeover_report["recovery_method"] == "stereo_lk_pnp_imu"
+    assert tracker.metric_pointmap_scale is None
+    assert tracker.recovery_reference is None
+    assert not tracker.vins_degraded
+    assert tracker.idx_f2k is None
+
+
+@pytest.mark.parametrize("failure", ["past_vins", "degraded", "probe", "nonconsecutive",
+                                      "no_source", "unknown_gauge"])
+def test_metric_startup_never_bypasses_normal_recovery_guards(monkeypatch, failure):
+    tracker, frame, _, _ = startup_metric_fixture(monkeypatch)
+    if failure == "past_vins":
+        tracker.vins_camera_poses[0]["valid"] = "1"
+    elif failure == "degraded":
+        tracker.vins_degraded = True
+    elif failure == "probe":
+        tracker.in_reentry_probe = True
+    elif failure == "nonconsecutive":
+        frame.frame_id = 0
+    elif failure == "no_source":
+        tracker.startup_metric_source = None
+    else:
+        tracker.previous_frame.T_WC.data[0, 7] = .4
+    original = frame.T_WC.data.clone()
+    assert not tracker.recover_startup_metric_pose(frame)
+    assert torch.equal(frame.T_WC.data, original)
+    assert not getattr(frame, "pose_only", False)
+
+
+@pytest.mark.parametrize("failure", ["pnp", "rotation", "motion", "nonfinite"])
+def test_metric_startup_rejects_failed_physical_observation(monkeypatch, failure):
+    tracker, frame, transform, report = startup_metric_fixture(monkeypatch)
+    if failure == "pnp":
+        report["accepted"] = False
+    elif failure == "rotation":
+        report["imu_rotation_disagreement_deg"] = 2.
+    elif failure == "motion":
+        transform[0, 3] = -.04
+    else:
+        transform[0, 3] = np.nan
+    original = frame.T_WC.data.clone()
+    assert not tracker.recover_startup_metric_pose(frame)
+    assert torch.equal(frame.T_WC.data, original)
+    assert not getattr(frame, "pose_only", False)
+
+
+def test_metric_startup_keeps_metric_translation_independent_of_visual_scale(monkeypatch):
+    tracker, frame, _, _ = startup_metric_fixture(monkeypatch)
+    tracker.metric_pointmap_scale = .4
+    tracker.previous_frame.T_WC.data[0, 7] = .4
+    tracker.previous_frame.T_WC.data[0, 3:7] = torch.tensor(
+        Rotation.from_euler("z", 90, degrees=True).as_quat(), dtype=torch.float32)
+    assert tracker.recover_startup_metric_pose(frame)
+    assert torch.allclose(frame.T_WC.data[0, :3], torch.tensor([0., .002, 0.]), atol=1e-7)
+    assert frame.T_WC.data[0, 7] == pytest.approx(.4)
+
+
+def test_consecutive_startup_outputs_do_not_depend_on_pending_reloc_pose(monkeypatch):
+    tracker, frame, _, _ = startup_metric_fixture(monkeypatch)
+    assert tracker.recover_startup_metric_pose(frame)
+    tracker.vins_camera_poses.append(row(2, valid="0"))
+    # The backend/shared frame remains the original rejected tracking payload.
+    tracker.previous_frame = SimpleNamespace(frame_id=1, T_WC=lietorch.Sim3.Identity(1))
+    next_frame = SimpleNamespace(frame_id=2, T_WC=lietorch.Sim3.Identity(1))
+    original = tracker.previous_frame.T_WC.data.clone()
+    assert tracker.recover_startup_metric_pose(next_frame)
+    assert torch.allclose(next_frame.T_WC.data[0, :3], torch.tensor([.004, 0, 0]))
+    assert torch.equal(tracker.previous_frame.T_WC.data, original)
+
+
 @pytest.mark.parametrize("costs,delta_norm,expected", [
     ([1., 2.], 1e-8, "uphill_visual_solve"),
     ([1., .8], 1e-8, "visual_solve_max_iterations"),

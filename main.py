@@ -470,6 +470,9 @@ if __name__ == "__main__":
             recon_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
+    if (config["tracking"].get("vins_visual_takeover", False)
+            and use_imu_rotation_prior and dataset.stereo_depth_provider is not None):
+        tracker.startup_metric_source = dataset.get_startup_metric_observation
     if use_spatial_pointmap_recovery:
         if K is None:
             raise ValueError("spatial pointmap recovery requires calibrated camera intrinsics")
@@ -660,6 +663,13 @@ if __name__ == "__main__":
 
         else:
             raise Exception("Invalid mode")
+
+        # Preserve the original RELOC state and reseeding logic. A measured
+        # startup pose fills only the output hole; it cannot promote bad geometry
+        # into keyframes, descriptors or the learned graph.
+        if not tracked and states.get_mode() == Mode.RELOC:
+            if tracker.recover_startup_metric_pose(frame):
+                tracked = True
 
         if add_new_kf:
             keyframes.append(frame)
