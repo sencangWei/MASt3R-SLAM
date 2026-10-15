@@ -528,6 +528,47 @@ def test_consecutive_startup_outputs_do_not_depend_on_pending_reloc_pose(monkeyp
     assert torch.equal(tracker.previous_frame.T_WC.data, original)
 
 
+def test_startup_gap_after_unscaled_visual_frame_measures_every_intermediate_pair(monkeypatch):
+    tracker, frame, _, _ = startup_metric_fixture(monkeypatch)
+    pairs = []
+    observation = tracker.startup_metric_source(0, 1)
+    tracker.startup_metric_source = lambda previous, current: pairs.append((previous, current)) or observation
+    assert tracker.recover_startup_metric_pose(frame)
+    tracker.vins_camera_poses.extend([row(2, valid="0"), row(3, valid="0")])
+    # A healthy unscaled visual output at2 is not a metric anchor.
+    tracker.previous_frame = SimpleNamespace(frame_id=2, T_WC=lietorch.Sim3.Identity(1))
+    tracker.previous_frame.T_WC.data[0, 0] = 999.
+    next_frame = SimpleNamespace(frame_id=3, T_WC=lietorch.Sim3.Identity(1))
+    original = tracker.previous_frame.T_WC.data.clone()
+    assert tracker.recover_startup_metric_pose(next_frame)
+    assert pairs == [(0, 1), (1, 2), (2, 3)]
+    assert torch.allclose(next_frame.T_WC.data[0, :3], torch.tensor([.006, 0, 0]))
+    assert torch.equal(tracker.previous_frame.T_WC.data, original)
+    assert tracker.metric_pointmap_scale is None and next_frame.pose_only
+
+
+@pytest.mark.parametrize("failure", ["missing", "pnp", "rotation", "motion", "nonfinite"])
+def test_startup_gap_rejects_unmeasured_intermediate_pair(monkeypatch, failure):
+    tracker, frame, transform, report = startup_metric_fixture(monkeypatch)
+    assert tracker.recover_startup_metric_pose(frame)
+    tracker.vins_camera_poses.extend([row(2, valid="0"), row(3, valid="0")])
+    tracker.previous_frame = SimpleNamespace(frame_id=2, T_WC=lietorch.Sim3.Identity(1))
+    next_frame = SimpleNamespace(frame_id=3, T_WC=lietorch.Sim3.Identity(1))
+    if failure == "missing":
+        tracker.startup_metric_source = lambda previous, current: None
+    elif failure == "pnp":
+        report["accepted"] = False
+    elif failure == "rotation":
+        report["imu_rotation_disagreement_deg"] = 2.
+    elif failure == "motion":
+        transform[0, 3] = -.04
+    else:
+        transform[0, 3] = np.nan
+    assert not tracker.recover_startup_metric_pose(next_frame)
+    assert tracker.last_startup_metric_frame_id == 1
+    assert not getattr(next_frame, "pose_only", False)
+
+
 @pytest.mark.parametrize("costs,delta_norm,expected", [
     ([1., 2.], 1e-8, "uphill_visual_solve"),
     ([1., .8], 1e-8, "visual_solve_max_iterations"),

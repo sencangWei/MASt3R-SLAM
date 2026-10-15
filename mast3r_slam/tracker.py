@@ -531,48 +531,65 @@ class FrameTracker:
         # for consecutive measured startup gaps instead of rewriting its pose.
         chained = getattr(self, "last_startup_metric_frame_id", None) == previous.frame_id
         previous_pose = (self.last_startup_metric_pose if chained else previous.T_WC)
+        source_frame_id = previous.frame_id
+        scale = self.metric_pointmap_scale
+        anchor_id = getattr(self, "last_startup_metric_frame_id", None)
+        if scale is None and anchor_id is not None and anchor_id < previous.frame_id:
+            # An intervening healthy visual output may still have no metric
+            # gauge. Remeasure every adjacent pair from our last physical
+            # anchor; never compose that unscaled visual translation.
+            source_frame_id = anchor_id
+            previous_pose = self.last_startup_metric_pose
         data = previous_pose.data[0].detach().cpu().numpy()
         if not np.isfinite(data).all() or data[7] <= 0:
             return False
         # An unscaled learned pose cannot become a metric anchor by assertion.
         # With no pointmap scale, use only the initial unit origin or a chain
         # of our own physically measured startup outputs.
-        scale = self.metric_pointmap_scale
         if scale is None:
-            trusted_prefix = (previous.frame_id == 0 or getattr(
-                self, "last_startup_metric_frame_id", None) == previous.frame_id)
+            trusted_prefix = (source_frame_id == 0 or anchor_id == source_frame_id)
             if not trusted_prefix or not np.isclose(data[7], 1.):
                 return False
         elif not np.isfinite(scale) or scale <= 0:
             return False
-        observation = source(previous.frame_id, frame.frame_id)
-        if observation is None:
-            return False
         from mast3r_slam.startup_metric_pose import solve_startup_metric_pose
-        transform, report = solve_startup_metric_pose(*observation, self.cfg)
-        if transform is None or report.get("accepted") is not True:
-            self.log_takeover(frame, "startup_metric_observation_rejected", False,
-                              pnp_report=report)
-            return False
-        transform = np.asarray(transform)
-        if transform.shape != (4, 4) or not np.isfinite(transform).all():
-            return False
-        rotation_error = float(report["imu_rotation_disagreement_deg"])
-        current_to_previous = np.linalg.inv(transform)
-        previous_rotation = Rotation.from_quat(data[3:7])
-        candidate_data = previous_pose.data.clone()
-        # PnP translation is already metres: as in VINS takeover, do not
-        # multiply it by the visual Sim3/pointmap scale.
-        candidate_data[0, :3] = torch.as_tensor(
-            data[:3] + previous_rotation.apply(current_to_previous[:3, 3]),
-            device=candidate_data.device, dtype=candidate_data.dtype)
-        candidate_data[0, 3:7] = torch.as_tensor(
-            (previous_rotation * Rotation.from_matrix(
-                current_to_previous[:3, :3])).as_quat(),
-            device=candidate_data.device, dtype=candidate_data.dtype)
+        measured_pairs = []
+        for current_id in range(source_frame_id + 1, frame.frame_id + 1):
+            observation = source(current_id - 1, current_id)
+            if observation is None:
+                return False
+            transform, report = solve_startup_metric_pose(*observation, self.cfg)
+            if transform is None or report.get("accepted") is not True:
+                self.log_takeover(frame, "startup_metric_observation_rejected", False,
+                                  pnp_report=report, observation_frame_id=current_id)
+                return False
+            transform = np.asarray(transform)
+            if transform.shape != (4, 4) or not np.isfinite(transform).all():
+                return False
+            rotation_error = float(report["imu_rotation_disagreement_deg"])
+            if (not np.isfinite(rotation_error) or rotation_error > 1.5
+                    or np.linalg.norm(transform[:3, 3]) > 0.03):
+                return False
+            current_to_previous = np.linalg.inv(transform)
+            data = previous_pose.data[0].detach().cpu().numpy()
+            previous_rotation = Rotation.from_quat(data[3:7])
+            candidate_data = previous_pose.data.clone()
+            # PnP translation is already metres, independent of visual scale.
+            candidate_data[0, :3] = torch.as_tensor(
+                data[:3] + previous_rotation.apply(current_to_previous[:3, 3]),
+                device=candidate_data.device, dtype=candidate_data.dtype)
+            candidate_data[0, 3:7] = torch.as_tensor(
+                (previous_rotation * Rotation.from_matrix(
+                    current_to_previous[:3, :3])).as_quat(),
+                device=candidate_data.device, dtype=candidate_data.dtype)
+            measured_pairs.append(dict(previous_frame_id=current_id - 1,
+                                       frame_id=current_id, pnp_report=report))
+            if current_id < frame.frame_id:
+                previous_pose = lietorch.Sim3(candidate_data)
         accepted = self.accept_startup_visual_pose(
             frame, lietorch.Sim3(candidate_data), rotation_error,
             dict(recovery_method="stereo_lk_pnp_imu", pnp_report=report,
+                 measured_pairs=measured_pairs,
                  metric_translation_source="recorded_stereo_baseline"),
             previous_pose=previous_pose)
         if accepted:

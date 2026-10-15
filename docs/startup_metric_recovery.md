@@ -18,7 +18,11 @@ the pending RELOC SharedStates payload. Normal relocalization still runs.
 Consecutive missing startup outputs have a separate measured output anchor.
 Physical translation is metres, not multiplied by visual Sim3 scale.
 Without an established metric pointmap gauge, only the initial unit-scale origin
-or a consecutive measured output chain may anchor the metric proposal.
+or a measured output chain may anchor the metric proposal. If an intervening
+healthy visual frame is still unscaled, remeasure every adjacent stereo/IMU
+pair from the last physical anchor to the missing frame. Reject the entire
+proposal if any intermediate measurement fails; do not use or rewrite the
+intervening visual output. Log each physical pair in `measured_pairs`.
 Do not use this exception for later VINS gaps, recovery windows or diagnostic
 graph probes. Healthy normal tracking remains first choice.
 
@@ -28,3 +32,11 @@ disagreement0.00538deg. These are not full-frontend coverage or E2E precision
 claims. The active22-case batch retains its old frozen source version.
 Full visual replays and raw E2E dev2 plus passing controls must precede any
 acceptance claim or production promotion.
+
+Isolated-worktree packaging: run `.venv/bin/python scripts/bind_runtime_lietorch.py`
+before the workflow. This validates the actually imported source repository,
+clean tracked source and pinned commit `e7df86554156b36846008d8ddbcc4d8521a16554`,
+then creates only a missing `thirdparty/lietorch` symlink to that source. It
+refuses conflicting paths and prints source/native-extension hashes. The
+existing run-manifest git query then reads the real dependency identity, not
+the enclosing toolchain repository's commit. No dependency source is changed.
